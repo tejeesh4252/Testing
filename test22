@@ -1,175 +1,332 @@
-#!/usr/bin/env python3
-"""
-pdf_dump.py — Diagnostic dump for PDF extraction debugging.
-
-For every PDF in a given file or folder, produces a .txt report containing:
-  1. Plain text (pypdf) — what a naive extractor sees
-  2. Layout-preserved text (pdftotext -layout) — spatial structure intact
-  3. Word-level coordinates (pdfplumber) — exact x/y position of every word,
-     which is what you need to debug "wrong field grabbed the wrong number"
-     bugs. If your regex or proximity logic is grabbing the ITD value from
-     the Contributions block, the coordinate dump shows exactly why.
-  4. Extracted tables (pdfplumber) — if the PDF has real tables, this shows
-     rows/columns as pdfplumber parsed them.
-
-Usage:
-    python3 pdf_dump.py /path/to/file.pdf
-    python3 pdf_dump.py /path/to/folder_of_pdfs/
-    python3 pdf_dump.py /path/to/folder_of_pdfs/ --outdir /path/to/output
-
-Each PDF gets its own <name>_dump.txt in the output directory (default:
-./pdf_dumps/ next to where you run the script).
-"""
-
-import argparse
-import subprocess
-import sys
-from pathlib import Path
-
-try:
-    import pdfplumber
-except ImportError:
-    print("ERROR: pdfplumber not installed. Run: pip install pdfplumber --break-system-packages")
-    sys.exit(1)
-
-try:
-    from pypdf import PdfReader
-except ImportError:
-    print("ERROR: pypdf not installed. Run: pip install pypdf --break-system-packages")
-    sys.exit(1)
+import re
 
 
-def get_plain_text(pdf_path):
-    """Naive text extraction — same rough method a lot of simple scripts use."""
-    out = []
+def extract(full_text, filename):
+    """
+    Extractor for Brockton Capital Fund III format.
+
+    Structure: Fund Performance Summary (FundMagic XML wrapper)
+    Two sections:
+    1. Reconciliation of Limited Partners' Capital
+    2. Reconciliation of Net Asset Value
+
+    Columns: Quarter to 31 December | Inception to 31 December
+    Currency: GBP
+    """
+    result = {
+        "Extraction Status": "SUCCESS",
+        "Extraction Notes": "",
+        "Template Used": "Brockton",
+        "Currency": "GBP",
+    }
+
     try:
-        reader = PdfReader(str(pdf_path))
-        for i, page in enumerate(reader.pages):
-            out.append(f"--- Page {i + 1} (pypdf plain) ---")
-            out.append(page.extract_text() or "[no text extracted]")
-    except Exception as e:
-        out.append(f"[pypdf extraction failed: {e}]")
-    return "\n".join(out)
-
-
-def get_layout_text(pdf_path):
-    """pdftotext -layout preserves column/table spatial alignment."""
-    try:
-        result = subprocess.run(
-            ["pdftotext", "-layout", str(pdf_path), "-"],
-            capture_output=True, text=True, timeout=60
+        result["Fund Name"]     = _extract_fund_name(
+            full_text, filename
         )
-        if result.returncode != 0:
-            return f"[pdftotext failed: {result.stderr}]"
-        return result.stdout
-    except FileNotFoundError:
-        return "[pdftotext not found on system — install poppler-utils]"
+        result["Investor Name"] = _extract_investor_name(
+            full_text
+        )
+        result["Report Date"]   = _extract_report_date(
+            full_text
+        )
+
+        # ── Commitment ─────────────────────────────────────────
+        result["Capital Commitment"] = _extract_labeled_value(
+            full_text,
+            [r'Total commitments\s+([\d,]+)']
+        )
+        result["Unfunded Commitment"] = _extract_labeled_value(
+            full_text,
+            [r'Amount not yet drawn down\s+([\d,]+)']
+        )
+
+        # ── LP section only ────────────────────────────────────
+        # The page shows LP column first then Fund column
+        # We extract the LP (left) column = first number on each row
+
+        result["Beginning Balance QTD"] = _extract_row(
+            full_text,
+            ["Net Asset Value at start of period"],
+            col=0
+        )
+
+        result["Contributions QTD"] = _extract_row(
+            full_text,
+            ["Amounts contributed"],
+            col=0
+        )
+
+        result["Distributions QTD"] = _extract_row(
+            full_text,
+            ["Distributions to Partners"],
+            col=0
+        )
+
+        result["Net Investment Income QTD"] = _extract_row(
+            full_text,
+            ["Investment income", "Bank interest"],
+            col=0
+        )
+
+        result["Management Fees QTD"] = _extract_row(
+            full_text,
+            ["Other expenses"],
+            col=0
+        )
+
+        result["Net Unrealized Gain/Loss QTD"] = _extract_row(
+            full_text,
+            ["Unrealised capital", "Unrealized capital"],
+            col=0
+        )
+
+        result["Ending Balance QTD"] = _extract_row(
+            full_text,
+            ["Net Asset Value before Revaluation",
+             "Net Assets Value after Revaluation",
+             "Net Asset Value"],
+            col=0
+        )
+
+        # ── ITD = LP Inception to 30 June column (col=1) ───────
+        result["Contributions ITD"] = _extract_row(
+            full_text,
+            ["Amounts contributed"],
+            col=1
+        )
+        result["Distributions ITD"] = _extract_row(
+            full_text,
+            ["Distributions to Partners"],
+            col=1
+        )
+        result["Net Investment Income ITD"] = _extract_row(
+            full_text,
+            ["Bank interest"],
+            col=1
+        )
+        result["Management Fees ITD"] = _extract_row(
+            full_text,
+            ["Other expenses"],
+            col=1
+        )
+        result["Net Realized Gain/Loss ITD"] = _extract_row(
+            full_text,
+            ["Realised capital gains"],
+            col=1
+        )
+        result["Ending Balance ITD"] = _extract_row(
+            full_text,
+            ["Net Asset Value before Revaluation",
+             "Net Assets Value after Revaluation",
+             "Net Asset Value"],
+            col=1
+        )
+
+        result["Ending Balance ITD"] = result["Ending Balance QTD"]
+        result["Ending Balance YTD"] = result["Ending Balance QTD"]
+
     except Exception as e:
-        return f"[pdftotext failed: {e}]"
+        result["Extraction Status"] = "ERROR"
+        result["Extraction Notes"]  = str(e)
+        return result
 
+    result = _validate_result(result)
+    return result
 
-def get_word_coordinates(pdf_path):
+def _extract_positional(line):
     """
-    Word-level x/y coordinates. This is the key diagnostic view: it tells you
-    exactly where on the page each word/number sits, so you can see whether
-    your regex/proximity logic is anchoring to the wrong block.
+    Parse a Brockton row into positional column values.
+
+    Tokens are either:
+      - A dash placeholder '-' or '--'  → None
+      - A number like 1,276,612         → float
+      - A negative in parens (311)      → negative float
+
+    Returns a list where position matches column index.
+    Year tokens (2000-2030) are skipped to avoid
+    header years being counted as values.
+
+    Example:
+      'Amounts contributed - 2,707,975 - 1,151,567,944'
+      → [None, 2707975.0, None, 1151567944.0]
+
+      'Other expenses (311) (126,296) (116,471) (47,272,178)'
+      → [-311.0, -126296.0, -116471.0, -47272178.0]
+
+      'Net Asset Value at start of period 1,276,612 - ...'
+      → [1276612.0, None, ...]
     """
-    out = []
-    try:
-        with pdfplumber.open(str(pdf_path)) as pdf:
-            for i, page in enumerate(pdf.pages):
-                out.append(f"--- Page {i + 1} (word coordinates: text | x0 | top | x1 | bottom) ---")
-                words = page.extract_words()
-                if not words:
-                    out.append("[no words found on this page]")
+    # Tokenise: find all dash placeholders and numeric tokens
+    token_pattern = (
+        r'\([\d,]+(?:\.\d+)?\)'   # negative in parens
+        r'|-{1,2}(?=\s|$)'        # dash placeholder
+        r'|-?[\d,]+(?:\.\d+)?'    # plain number
+    )
+    tokens = re.findall(token_pattern, line)
+    values = []
+    for t in tokens:
+        t = t.strip()
+        if re.fullmatch(r'-{1,2}', t):
+            # Dash = positional placeholder → None
+            values.append(None)
+        elif t.startswith('(') and t.endswith(')'):
+            clean = re.sub(r'[()\s,]', '', t)
+            try:
+                val = float(clean)
+                # Skip year tokens
+                if 2000.0 <= val <= 2030.0:
                     continue
-                for w in words:
-                    out.append(
-                        f"{w['text']!r:30s} x0={w['x0']:.1f} top={w['top']:.1f} "
-                        f"x1={w['x1']:.1f} bottom={w['bottom']:.1f}"
-                    )
-    except Exception as e:
-        out.append(f"[pdfplumber word extraction failed: {e}]")
-    return "\n".join(out)
-
-
-def get_tables(pdf_path):
-    """Extract tables as pdfplumber sees them — rows and columns."""
-    out = []
-    try:
-        with pdfplumber.open(str(pdf_path)) as pdf:
-            for i, page in enumerate(pdf.pages):
-                tables = page.extract_tables()
-                if not tables:
+                values.append(-val)
+            except ValueError:
+                continue
+        else:
+            clean = re.sub(r'[\s,]', '', t)
+            try:
+                val = float(clean)
+                # Skip year tokens
+                if 2000.0 <= val <= 2030.0:
                     continue
-                out.append(f"--- Page {i + 1}: {len(tables)} table(s) found ---")
-                for t_idx, table in enumerate(tables):
-                    out.append(f"[Table {t_idx + 1}]")
-                    for row in table:
-                        out.append(" | ".join(cell if cell else "" for cell in row))
-                    out.append("")
-    except Exception as e:
-        out.append(f"[pdfplumber table extraction failed: {e}]")
-    if not out:
-        out.append("[no tables detected by pdfplumber]")
-    return "\n".join(out)
+                values.append(val)
+            except ValueError:
+                continue
+    return values
 
 
-def dump_pdf(pdf_path, outdir):
-    pdf_path = Path(pdf_path)
-    print(f"Processing: {pdf_path.name}")
+def _extract_row(text, labels, col=0):
+    """
+    Extract value from labelled row respecting column position.
 
-    sections = []
-    sections.append(f"{'=' * 80}\nPDF DIAGNOSTIC DUMP: {pdf_path.name}\n{'=' * 80}\n")
+    Brockton has 4 columns:
+      col 0 = LP Quarter to 30 June  (QTD)
+      col 1 = LP Inception to 30 June (ITD)
+      col 2 = Fund Quarter  (ignored)
+      col 3 = Fund Inception (ignored)
 
-    sections.append(f"\n{'#' * 80}\n# SECTION 1: PLAIN TEXT (pypdf) — naive extraction, no layout awareness\n{'#' * 80}\n")
-    sections.append(get_plain_text(pdf_path))
+    Dashes (-) are positional placeholders — they must be
+    counted as None so column positions are preserved.
+    Without this, a dash in col 0 causes col 1 value to
+    be returned as col 0.
+    """
+    lines = text.split('\n')
+    for label in labels:
+        for i, line in enumerate(lines):
+            if label.lower() not in line.lower():
+                continue
+            # Build combined window (label line + up to 3 next)
+            combined = line
+            for j in range(1, 4):
+                if i + j < len(lines):
+                    combined += ' ' + lines[i + j]
+            # Parse positional tokens — treat '-' as None
+            values = _extract_positional(combined)
+            if len(values) > col:
+                return values[col]
+    return None
 
-    sections.append(f"\n\n{'#' * 80}\n# SECTION 2: LAYOUT TEXT (pdftotext -layout) — spatial structure preserved\n{'#' * 80}\n")
-    sections.append(get_layout_text(pdf_path))
 
-    sections.append(f"\n\n{'#' * 80}\n# SECTION 3: WORD COORDINATES (pdfplumber) — exact position of every word\n{'#' * 80}\n")
-    sections.append(get_word_coordinates(pdf_path))
-
-    sections.append(f"\n\n{'#' * 80}\n# SECTION 4: TABLES (pdfplumber) — parsed table structure, if any\n{'#' * 80}\n")
-    sections.append(get_tables(pdf_path))
-
-    outdir = Path(outdir)
-    outdir.mkdir(parents=True, exist_ok=True)
-    out_file = outdir / f"{pdf_path.stem}_dump.txt"
-    out_file.write_text("\n".join(sections), encoding="utf-8")
-    print(f"  -> {out_file}")
-    return out_file
+def _extract_labeled_value(text, patterns):
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            return _clean_number(match.group(1))
+    return None
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Dump diagnostic text/coordinate data from PDFs.")
-    parser.add_argument("input", help="Path to a single PDF or a folder of PDFs")
-    parser.add_argument("--outdir", default="./pdf_dumps", help="Output directory for dump .txt files")
-    args = parser.parse_args()
-
-    input_path = Path(args.input)
-    if not input_path.exists():
-        print(f"ERROR: {input_path} does not exist")
-        sys.exit(1)
-
-    if input_path.is_dir():
-        pdfs = sorted(input_path.glob("*.pdf")) + sorted(input_path.glob("*.PDF"))
-        if not pdfs:
-            print(f"No PDFs found in {input_path}")
-            sys.exit(1)
-    else:
-        pdfs = [input_path]
-
-    results = []
-    for pdf in pdfs:
+def _extract_numbers(line):
+    pattern = r'\([\d,]+(?:\.\d+)?\)|-?[\d,]+(?:\.\d+)?'
+    matches = re.findall(pattern, line)
+    numbers = []
+    for m in matches:
+        is_neg = m.startswith('(') and m.endswith(')')
+        clean  = re.sub(r'[()\s,]', '', m)
         try:
-            results.append(dump_pdf(pdf, args.outdir))
-        except Exception as e:
-            print(f"  FAILED on {pdf.name}: {e}")
+            val = float(clean)
+            if 2000.0 <= val <= 2030.0 and '.' not in m:
+                continue
+            numbers.append(-val if is_neg else val)
+        except ValueError:
+            continue
+    return numbers
 
-    print(f"\nDone. {len(results)} dump file(s) written to {Path(args.outdir).resolve()}")
+
+def _extract_fund_name(full_text, filename):
+    match = re.search(
+        r'BROCKTON CAPITAL FUND[^\n]{0,20}',
+        full_text, re.IGNORECASE
+    )
+    if match:
+        return match.group(0).strip()[:100]
+    name  = filename.replace('.pdf', '').replace('.PDF', '')
+    parts = name.split(' - ')
+    return parts[1].strip() if len(parts) >= 2 else name[:80]
 
 
-if __name__ == "__main__":
-    main()
+def _extract_investor_name(full_text):
+    match = re.search(
+        r'(?:prepared for|Unaudited.*?prepared for)[:\s]+'
+        r'(Portfolio Advisors[^\n]{5,80})',
+        full_text, re.IGNORECASE
+    )
+    if match:
+        return re.sub(
+            r'\s+', ' ', match.group(1).strip()
+        )[:150]
+    match = re.search(
+        r'(Portfolio Advisors[^\n]{5,80})',
+        full_text, re.IGNORECASE
+    )
+    if match:
+        return re.sub(
+            r'\s+', ' ', match.group(1).strip()
+        )[:150]
+    return ""
+
+
+def _extract_report_date(full_text):
+    match = re.search(
+        r'(\d{1,2}/\d{1,2}/\d{4})',
+        full_text, re.IGNORECASE
+    )
+    if match:
+        return match.group(1).strip()
+    return "31/12/2025"
+
+
+def _clean_number(value_str):
+    if not value_str:
+        return None
+    s = str(value_str).strip()
+    if s in ['-', '--', '–', '—', '$-', '$ -', '']:
+        return 0.0
+    is_negative = '(' in s and ')' in s
+    s = re.sub(r'[\$,\s]', '', s)
+    s = s.replace('(', '').replace(')', '')
+    try:
+        return -float(s) if is_negative else float(s)
+    except ValueError:
+        return None
+
+
+def _validate_result(result):
+    notes = []
+    has_ending = any([
+        result.get("Ending Balance QTD"),
+        result.get("Ending Balance YTD"),
+        result.get("Ending Balance ITD"),
+    ])
+    has_beginning = any([
+        result.get("Beginning Balance QTD"),
+        result.get("Beginning Balance YTD"),
+        result.get("Beginning Balance ITD"),
+    ])
+    if not has_ending:
+        notes.append("Missing ending balance")
+        result["Extraction Status"] = "PARTIAL"
+    elif not has_beginning:
+        notes.append("Missing beginning balance")
+        result["Extraction Status"] = "PARTIAL"
+    else:
+        result["Extraction Status"] = "SUCCESS"
+    result["Extraction Notes"] = " | ".join(notes)
+    return result
