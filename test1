@@ -1,0 +1,2300 @@
+# -*- coding: utf-8 -*-
+import re
+
+
+def extract(full_text, filename):
+    """
+    Extractor for Revolution Growth/Ventures format.
+    Also covers: Sorenson, DAG Ventures, Marlin, OrbiMed,
+    American Securities, Saw Mill, SPC Partners, Swander Pace,
+    Caltius, GenNx360, Glouston, New Heritage, BPOC Ventus,
+    Beecken Petty, Columbia Capital, PA2014, Tengram, KKR Asian,
+    Orchid Asia, CPEChina, FountainVest, Baring Asia,
+    DFJ/Threshold, Indium V, Waud/Norwest, Norwest Mezzanine,
+    Platinum Equity, Riverside, Insight Venture, Harbert,
+    Fireside, Greenfield, Meadow RE, Carlyle Realty,
+    Hampshire Partners, CSIM, Canaan, Sorenson, DAG Ventures,
+    RRJ Capital, CVC Capital, Small Caps, Sparring Capital,
+    Africa Top Invest, Partners Group RE, Metropolitan RE Global,
+    Stonepeak RE, Rialto RE, JBG Urban, PEG Secondary
+    """
+    result = {
+        "Extraction Status": "SUCCESS",
+        "Extraction Notes": "",
+        "Template Used":    "Revolution",
+        "Currency":         "USD",
+    }
+
+    # ── SKIP: Valuation memos and appraisal reports ────────────────────────
+    # These are not capital account statements — no financial data to extract
+    if re.search(
+        r'Valuation Memo|Appraisal Report|PORTFOLIO REVIEW'
+        r'|Investment Type:|PA Vehicle',
+        filename, re.IGNORECASE
+    ) or re.search(
+        r'PORTFOLIO REVIEW\s*\n.*?Investment(?:\s+Project|\s+Type)',
+        full_text, re.IGNORECASE
+    ):
+        result["Extraction Status"] = "SKIP"
+        result["Extraction Notes"]  = (
+            "Valuation memo or appraisal report — "
+            "not a capital account statement"
+        )
+        return result
+    # ── END SKIP ──────────────────────────────────────────────────────────
+
+    try:
+        if _is_fmv_schedule(full_text):
+            result["Extraction Status"] = "SKIP"
+            result["Extraction Notes"]  = (
+                "Fair Market Value schedule — "
+                "no capital account data"
+            )
+            return result
+
+        result["Fund Name"]     = _extract_fund_name(
+            full_text, filename
+        )
+        result["Investor Name"] = _extract_investor_name(
+            full_text
+        )
+        result["Report Date"]   = _extract_report_date(
+            full_text
+        )
+        result["Ownership %"]   = _extract_ownership(full_text)
+
+        result["Capital Commitment"]  = _extract_commitment(
+            full_text
+        )
+        result["Unfunded Commitment"] = _extract_unfunded(
+            full_text
+        )
+
+        _beg_labels = [
+            "Beginning balance",
+            "Beginning capital",
+            r"Beginning.s?\s+Capital",
+            "Partners' capital, beginning",
+            "Partners' capital, beginning of",
+            "Capital account balance.*January",
+            "Opening Capital",
+            "Partners' capital at Jan",
+            "Balance, beginning",
+            "Capital.*January 1",
+            r"Capital account.*?beginning",
+            r"Balance at.*?(?:January|February|March|April|May|June|"
+            r"July|August|September|October|November|December)\s+\d",
+            r"Partners.*?capital.*?beginning",
+            r"Capital.*?beginning of period",
+            r"Opening balance",
+            r"Balance.*?beginning of",
+            r"Net assets.*?beginning",
+            r"Balance\s+at\s+\d{1,2}/\d{1,2}/20\d{2}",
+            r"Beginning\s+Partners['']?\s+Capital",
+            r"Beginning\s+Partners['']?\s+Deficit",
+            r"Opening\s+Partner.s\s+Capital",
+            r"Opening\s+Capital\s+(?:Account\s+)?Balance",
+            r"Beginning\s+of\s+Period",
+            r"Capital\s+Account\s+Balance\s+at\s+\d",
+            r"Partner.s\s+capital\s+as\s+of\s+December\s+31,\s+20\d{2}",
+            r"Partner.s\s+Capital,\s+\d+\s+January\s+\d{4}",
+            r"Partner.s\s+Capital,\s+01\s+January",
+            r"Beginning\s+Loan\s+Value",
+            r"Net\s+Asset\s+Value\s+.+Units\s+as\s+of\s+30\s+September",
+            r"LP\s+&\s+CIP\s+Interests\s+-\s+30th\s+September",
+            r"Beginning\s+Capital\s+Balance",
+        ]
+
+        result["Beginning Balance QTD"] = _extract_row(
+            full_text, _beg_labels, col=0
+        )
+        result["Beginning Balance YTD"] = _extract_row(
+            full_text, _beg_labels, col=1
+        )
+
+        _cont_labels = [
+            "Capital contributions",
+            "Contributions",
+            "Net capital contributions",
+            "Net capital contr",
+        ]
+        result["Contributions QTD"] = _extract_row(
+            full_text, _cont_labels, col=0,
+            guard_commitment=True
+        )
+        result["Contributions YTD"] = _extract_row(
+            full_text, _cont_labels, col=1,
+            guard_commitment=True
+        )
+        result["Contributions ITD"] = _extract_row(
+            full_text, _cont_labels, col=2,
+            guard_commitment=True
+        )
+        _dist_labels = [
+            "Capital distributions",
+            "Distributions",
+            "Return of Capital",
+            "Return of capital",
+        ]
+        if re.search(r'CANAAN', full_text, re.IGNORECASE):
+            result["Distributions QTD"] = (
+                _extract_canaan_distributions(full_text, col=0)
+            )
+            result["Distributions YTD"] = (
+                _extract_canaan_distributions(full_text, col=1)
+            )
+            result["Distributions ITD"] = None
+        else:
+            result["Distributions QTD"] = _extract_row(
+                full_text, _dist_labels, col=0,
+                guard_commitment=True
+            )
+            result["Distributions YTD"] = _extract_row(
+                full_text, _dist_labels, col=1,
+                guard_commitment=True
+            )
+            result["Distributions ITD"] = _extract_row(
+                full_text, _dist_labels, col=2,
+                guard_commitment=True
+            )
+
+        _nii_labels = [
+            "Net investment income",
+            "Net income",
+            "Income / Loss",
+            "Investment income",
+            "Net operating income",
+            "Net investment loss",
+        ]
+        if re.search(r'CANAAN', full_text, re.IGNORECASE):
+            result["Net Investment Income QTD"] = (
+                _extract_canaan_nii(full_text, col=0)
+            )
+            result["Net Investment Income YTD"] = (
+                _extract_canaan_nii(full_text, col=1)
+            )
+            result["Net Investment Income ITD"] = None
+        else:
+            result["Net Investment Income QTD"] = _extract_row(
+                full_text, _nii_labels, col=0
+            )
+            result["Net Investment Income YTD"] = _extract_row(
+                full_text, _nii_labels, col=1
+            )
+            result["Net Investment Income ITD"] = _extract_row(
+                full_text, _nii_labels, col=2
+            )
+
+        _real_labels = [
+            "Net realized gain",
+            "Realized gain",
+            "Gain/Loss on investments",
+            "Net realized",
+        ]
+        result["Net Realized Gain/Loss QTD"] = _extract_row(
+            full_text, _real_labels, col=0
+        )
+        result["Net Realized Gain/Loss YTD"] = _extract_row(
+            full_text, _real_labels, col=1
+        )
+        result["Net Realized Gain/Loss ITD"] = _extract_row(
+            full_text, _real_labels, col=2
+        )
+
+        _unreal_labels = [
+            "Net change in unrealized",
+            "Unrealized gain",
+            "Change in fair value",
+            "Net unrealized",
+            "Change in net unrealized",
+        ]
+        result["Net Unrealized Gain/Loss QTD"] = _extract_row(
+            full_text, _unreal_labels, col=0
+        )
+        result["Net Unrealized Gain/Loss YTD"] = _extract_row(
+            full_text, _unreal_labels, col=1
+        )
+        result["Net Unrealized Gain/Loss ITD"] = _extract_row(
+            full_text, _unreal_labels, col=2
+        )
+
+        _mgmt_labels = [
+            "Management fees",
+            "Management fee",
+        ]
+        result["Management Fees QTD"] = _extract_row(
+            full_text, _mgmt_labels, col=0
+        )
+        result["Management Fees YTD"] = _extract_row(
+            full_text, _mgmt_labels, col=1
+        )
+        result["Management Fees ITD"] = _extract_row(
+            full_text, _mgmt_labels, col=2
+        )
+
+        _carry_labels = [
+            "Incentive allocation",
+            "Carried interest",
+            "Performance fee",
+            "Provision for carried interest",
+        ]
+        result["Carried Interest QTD"] = _extract_row(
+            full_text, _carry_labels, col=0
+        )
+        result["Carried Interest YTD"] = _extract_row(
+            full_text, _carry_labels, col=1
+        )
+        result["Carried Interest ITD"] = _extract_row(
+            full_text, _carry_labels, col=2
+        )
+
+        qtd, ytd, itd = _extract_ending_all_cols(full_text)
+        result["Ending Balance QTD"] = qtd
+        result["Ending Balance YTD"] = ytd
+        result["Ending Balance ITD"] = itd
+
+        result["IRR"]  = _extract_irr(full_text)
+        result["MOIC"] = _extract_moic(full_text)
+
+    except Exception as e:
+        result["Extraction Status"] = "ERROR"
+        result["Extraction Notes"]  = str(e)
+        return result
+
+    result = _validate_result(result)
+    return result
+
+
+# ══════════════════════════════════════════════════════════════
+# FMV SCHEDULE DETECTION
+# ══════════════════════════════════════════════════════════════
+
+def _is_fmv_schedule(text):
+    return bool(re.search(
+        r'Schedule\s+of\s+Fair\s+Market\s+Value',
+        text, re.IGNORECASE
+    ))
+
+
+# ══════════════════════════════════════════════════════════════
+# ENDING BALANCE — LABEL PATTERNS
+# ══════════════════════════════════════════════════════════════
+
+_ENDING_LABELS = [
+    r'Ending\s+balance\s+at\s+(?:January|February|March|April|'
+    r'May|June|July|August|September|October|November|December)'
+    r'\s+\d{1,2},?\s+\d{4}',
+
+    r'Balance,\s+(?:January|February|March|April|May|June|July|'
+    r'August|September|October|November|December)'
+    r'\s+\d{1,2},?\s+\d{4}',
+
+    r"Partner.s\s+capital,\s+ending",
+    r"Ending\s+Partners['']?\s+Capital",
+    r"Ending\s+Partners['']?\s+Deficit",
+    r'Capital\s+account\s+at\s+fair\s+value',
+    r"Ending\s+Partner.s\s+Capital",
+    r"Ending\s+Capital\s+\$",
+    r"Partner.s\s+Capital,\s+31\s+December\s+\d{4}",
+    r"Partner.s\s+Capital,\s+\d+\s+December\s+\d{4}",
+    r"Ending\s+Capital\s+Account\s*[-]",
+    r"Net\s+Asset\s+Value\s+.+Units\s+as\s+of\s+31",
+    r"Net\s+Asset\s+Value\s+.+Units\s+as\s+of\s+December",
+    r"Net\s+Asset\s+Value\s+of\s+the\s+(?:share\s+class|Fund)",
+    r"Estimated\s+Net\s+Asset\s+Value",
+    r"Ending\s+Capital\s+Balance",
+    r"EndingNAV",
+    r"Ending\s+NAV",
+    r'Balance\s+at\s+\d{1,2}/\d{1,2}/20\d{2}',
+    r'Capital\s+Account\s*[-]\s*Ending\s+Balance',
+    r'Capital\s+Account\s*[-]\s*End',
+    r"Closing\s+Partner.s\s+Capital\s+Balance",
+    r"Closing\s+Capital\s+(?:Account\s+)?(?:Balance|as\s+of)",
+    r"End\s+of\s+Period",
+    r"Ending\s+Loan\s+Value",
+    r"Fair\s+Value\s+of\s+Capital",
+    r'Ending\s+balance(?!\s+at\s+(?:January|February|March))',
+    r'Closing\s+balance',
+    r'Ending\s+capital\s+balance',
+    r'Ending\s+capital\s+account',
+    r"Partners['']?\s*capital(?:,\s*end|.*?end\s+of)",
+    r'Net\s+asset\s+value.*?end(?:ing)?',
+    r'Capital\s+account.*?end(?:ing)?',
+    r'Capital\s+balance.*?(?:January|February|March|April|May|June|July|August|September|October|November|December)',
+    r'Balance\s+at\s+(?:January|February|March|April|May|June|July|August|September|October|November|December)',
+    r'Capital,\s+\d{1,2}/\d{1,2}/\d{2,4}',
+    r"Partner.s\s+capital\s+as\s+of\s+December\s+31,\s+20\d{2}",
+    r"Partners['']?\s*capital.*?(?:January|February|March|April|May|June|July|August|September|October|November|December)",
+    r"Ending\s+Capital\s+Account\s+Balance",
+    r'Ending.*?[Bb]alance',
+    r'Partners.*?capital.*?end',
+]
+_MONTHS = (
+    r'(?:January|February|March|April|May|June|'
+    r'July|August|September|October|November|December)'
+)
+_MONTH_PATTERN = (
+    r'(?:January|February|March|April|May|June|'
+    r'July|August|September|October|November|December)'
+    r'\s+\d{1,2},?\s+\d{4}'
+)
+
+
+def _strip_date(text):
+    return re.sub(
+        _MONTH_PATTERN, '', text, flags=re.IGNORECASE
+    )
+
+
+def _strip_percentages(text):
+    cleaned = re.sub(r'\d+\.\d+%', '', text)
+    cleaned = re.sub(
+        r'(?<!\d)(\d{1,2}\.\d{4})(?!\d)', '', cleaned
+    )
+    return cleaned
+
+
+def _normalize_european_numbers(text):
+    cleaned = re.sub(
+        r'(\d)\s+(\d{3})(?=\s|\d|,|\.|\b)', r'\1\2', text
+    )
+    cleaned = re.sub(r'(\d),(\d{2})(?!\d)', r'\1.\2', cleaned)
+    return cleaned
+
+
+def _normalize_swiss_numbers(text):
+    return re.sub(r"(\d)'(\d)", r'\1\2', text)
+
+
+# ══════════════════════════════════════════════════════════════
+# ENDING BALANCE — MULTI-PASS EXTRACTOR
+# ══════════════════════════════════════════════════════════════
+
+def _extract_ending_all_cols(full_text):
+    """
+    Master ending-balance extractor.
+    Priority:
+    0. Fund-specific special parsers
+    1. Label scanning (>100 filter)
+    2. Deduplicate candidates
+    3. Single unique value -> all three columns
+    """
+    hampshire_end = _extract_hampshire_ending(full_text)
+    if hampshire_end is not None:
+        return hampshire_end, hampshire_end, hampshire_end
+
+    orchid_val = _extract_orchid_ending(full_text)
+    if orchid_val is not None:
+        return orchid_val, orchid_val, orchid_val
+
+    fountainvest_val = _extract_fountainvest_ending(full_text)
+    if fountainvest_val is not None:
+        return (
+            fountainvest_val,
+            fountainvest_val,
+            fountainvest_val,
+        )
+
+    # ── DFJ / Threshold Ventures ──────────────────────────────
+    # "End of Period $3,621,549" — extract $ directly
+    # avoids position_id numbers leaking via label scan
+    if re.search(
+        r'Draper\s+Fisher|Threshold\s+Ventures',
+        full_text, re.IGNORECASE
+    ):
+        dfj_val = _extract_dfj_ending(full_text)
+        if dfj_val is not None:
+            return dfj_val, dfj_val, dfj_val
+
+    # ── PA2014 ────────────────────────────────────────────────
+    # "Closing Capital Account Balance 53,591,828 53,591,828"
+    if re.search(
+        r'PA2014\s+Private\s+Equity',
+        full_text, re.IGNORECASE
+    ):
+        pa2014_val = _extract_pa2014_ending(full_text)
+        if pa2014_val is not None:
+            if isinstance(pa2014_val, tuple):
+                return pa2014_val
+            return pa2014_val, pa2014_val, pa2014_val
+
+    # ── PEG Secondary ─────────────────────────────────────────
+    # Multi-fund summary — finds QTD Total Funds ending value
+    if re.search(
+        r'PEG\s+Secondary\s+Private\s+Equity',
+        full_text, re.IGNORECASE
+    ):
+        peg_val = _extract_peg_ending(full_text)
+        if peg_val is not None:
+            return peg_val, peg_val, peg_val
+
+    cpechina2_val = _extract_cpechina_ending(full_text)
+    if cpechina2_val is not None:
+        if isinstance(cpechina2_val, tuple):
+            return cpechina2_val
+        return cpechina2_val, cpechina2_val, cpechina2_val
+
+    cpechina3_val = _extract_cpechina3_ending(full_text)
+    if cpechina3_val is not None:
+        if isinstance(cpechina3_val, tuple):
+            return cpechina3_val
+        return cpechina3_val, cpechina3_val, cpechina3_val
+
+    canaan_val = _extract_canaan_ending(full_text)
+    if canaan_val is not None:
+        return canaan_val, canaan_val, canaan_val
+
+    sorenson_val = _extract_sorenson_ending(full_text)
+    if sorenson_val is not None:
+        return sorenson_val
+
+    dag_val = _extract_dag_ending(full_text)
+    if dag_val is not None:
+        return dag_val, dag_val, dag_val
+
+    rrj_val = _extract_rrj_ending(full_text)
+    if rrj_val is not None:
+        return rrj_val, rrj_val, rrj_val
+
+    cvc_val = _extract_cvc_ending(full_text)
+    if cvc_val is not None:
+        return cvc_val, cvc_val, cvc_val
+
+    small_caps_val = _extract_small_caps_ending(full_text)
+    if small_caps_val is not None:
+        return small_caps_val, small_caps_val, small_caps_val
+
+    sparring_val = _extract_sparring_ending(full_text)
+    if sparring_val is not None:
+        return sparring_val, sparring_val, sparring_val
+
+    africa_val = _extract_africa_ending(full_text)
+    if africa_val is not None:
+        return africa_val, africa_val, africa_val
+
+    metro_val = _extract_simple_ending_balance(full_text)
+    if metro_val is not None:
+        return metro_val, metro_val, metro_val
+
+    partners_val = _extract_partners_group_ending(full_text)
+    if partners_val is not None:
+        return partners_val, partners_val, partners_val
+
+    stonepeak_val = _extract_stonepeak_ending(full_text)
+    if stonepeak_val is not None:
+        return stonepeak_val, stonepeak_val, stonepeak_val
+
+    csim_val = _extract_csim_ending(full_text)
+    if csim_val is not None:
+        return csim_val, csim_val, csim_val
+
+    meadow_val = _extract_meadow_ending(full_text)
+    if meadow_val is not None:
+        return meadow_val, meadow_val, meadow_val
+
+    greenfield_val = _extract_greenfield_ending(full_text)
+    if greenfield_val is not None:
+        return greenfield_val, greenfield_val, greenfield_val
+
+    new_heritage_val = _extract_new_heritage_ending(full_text)
+    if new_heritage_val is not None:
+        return (
+            new_heritage_val,
+            new_heritage_val,
+            new_heritage_val,
+        )
+
+    platinum_totals = _extract_platinum_totals(full_text)
+    if platinum_totals is not None:
+        return platinum_totals, platinum_totals, platinum_totals
+
+    platinum_col = _extract_platinum_ending(full_text)
+    if platinum_col is not None:
+        return platinum_col, platinum_col, platinum_col
+
+    caltius_val = _extract_caltius_ending(full_text)
+    if caltius_val is not None:
+        return caltius_val, caltius_val, caltius_val
+
+    # ── Label-based scanning ───────────────────────────────────
+    lines = full_text.split('\n')
+    n     = len(lines)
+    hits  = []
+
+    for label in _ENDING_LABELS:
+        for i, line in enumerate(lines):
+            if not re.search(label, line, re.IGNORECASE):
+                continue
+
+            window = line
+            for j in range(1, 4):
+                if i + j < n:
+                    next_line = lines[i + j]
+                    if re.match(
+                        r'^[A-Z][A-Z\s]{10,}$',
+                        next_line.strip()
+                    ):
+                        break
+                    window += ' ' + next_line
+
+            cleaned = _strip_date(window)
+            cleaned = _strip_percentages(cleaned)
+            nums    = _extract_numbers(cleaned)
+            nums    = [n for n in nums if abs(n) > 100]
+
+            if nums:
+                hits.append((i, nums))
+
+        if any(len(h[1]) >= 3 for h in hits):
+            break
+
+    if not hits:
+        return None, None, None
+
+    for _, nums in hits:
+        if len(nums) >= 3:
+            return nums[0], nums[1], nums[2]
+
+    for _, nums in hits:
+        if len(nums) == 2:
+            return nums[0], nums[1], None
+
+    candidates = [
+        nums[0] for _, nums in hits
+        if nums and abs(nums[0]) > 1000
+    ]
+    if not candidates:
+        candidates = [
+            nums[0] for _, nums in hits
+            if nums and abs(nums[0]) > 100
+        ]
+
+    if not candidates:
+        return None, None, None
+
+    unique = _deduplicate_values(candidates)
+
+    if len(unique) >= 3:
+        return unique[0], unique[1], unique[2]
+    elif len(unique) == 2:
+        return unique[0], unique[1], None
+    else:
+        v = unique[0]
+        return v, v, v
+
+
+# ══════════════════════════════════════════════════════════════
+# SPECIAL FORMAT PARSERS
+# ══════════════════════════════════════════════════════════════
+
+def _extract_dfj_ending(text):
+    """
+    DFJ / Threshold Ventures:
+    Line: "End of Period $3,621,549"
+    Extract $ value directly.
+    """
+    lines = text.split('\n')
+    for line in lines:
+        if not re.search(
+            r'End\s+of\s+Period', line, re.IGNORECASE
+        ):
+            continue
+        nums = re.findall(r'\$\s*([\d,]+(?:\.\d+)?)', line)
+        for n in nums:
+            try:
+                val = float(n.replace(',', ''))
+                if val > 100:
+                    return val
+            except ValueError:
+                pass
+    return None
+
+
+def _extract_pa2014_ending(text):
+    """
+    PA2014 Private Equity Fund I:
+    Line: "Closing Capital Account Balance 53,591,828 53,591,828"
+    Returns (ytd, ytd, itd) tuple.
+    """
+    lines = text.split('\n')
+    for line in lines:
+        if not re.search(
+            r'Closing\s+Capital\s+Account\s+Balance',
+            line, re.IGNORECASE
+        ):
+            continue
+        nums = re.findall(r'[\d,]+(?:\.\d+)?', line)
+        values = []
+        for n in nums:
+            try:
+                val = float(n.replace(',', ''))
+                if val > 1000:
+                    values.append(val)
+            except ValueError:
+                pass
+        if len(values) >= 2:
+            return values[0], values[1], values[1]
+        elif len(values) >= 1:
+            v = values[0]
+            return v, v, v
+    return None
+
+
+def _extract_peg_ending(text):
+    """
+    PEG Secondary Private Equity — multi-fund summary format.
+
+    File has two table sections:
+    1. Since Inception: "Total Funds: 93,997,513 0 46,502,066..."
+    2. QTD (Oct-Dec):   "Total Funds: 93,997,513 16,069,208 0..."
+
+    Use SECOND Total Funds line = QTD section.
+    Ending capital = last large number on that line.
+
+    Fixes:
+    - EndQTD=31 from date "12/31/2025" in file header
+    - DistribQTD=36M from Opening Capital in table row
+    Both avoided by using dedicated parser.
+    """
+    lines = text.split('\n')
+    total_funds_lines = []
+
+    for i, line in enumerate(lines):
+        if re.search(
+            r'Total\s+Funds:', line, re.IGNORECASE
+        ):
+            total_funds_lines.append((i, line))
+
+    # Second Total Funds line = QTD section
+    target_lines = (
+        total_funds_lines[1:2]
+        if len(total_funds_lines) >= 2
+        else total_funds_lines
+    )
+
+    for i, line in target_lines:
+        window = line
+        if i + 1 < len(lines):
+            window += ' ' + lines[i + 1]
+
+        cleaned = _strip_date(_strip_percentages(window))
+        nums    = _extract_numbers(cleaned)
+        nums    = [n for n in nums if abs(n) > 1000]
+
+        if nums:
+            return nums[-1]
+
+    return None
+
+
+def _extract_cpechina_ending(text):
+    """CPEChina Fund II — Closing Capital as of 31 December."""
+    lines = text.split('\n')
+    for i, line in enumerate(lines):
+        if not re.search(
+            r'Closing\s+Capital\s+as\s+of',
+            line, re.IGNORECASE
+        ):
+            continue
+        if re.search(r'unfunded', line, re.IGNORECASE):
+            continue
+        cleaned = re.sub(
+            r'\b(?:January|February|March|April|May|June|'
+            r'July|August|September|October|November|December)'
+            r'\s+\d{1,2},?\s*\d{0,4}',
+            '', line, flags=re.IGNORECASE
+        )
+        cleaned = re.sub(r'\b20\d{2}\b', '', cleaned)
+        cleaned = re.sub(r'\b3[01]\b', '', cleaned)
+        nums = re.findall(r'[\d,]+(?:\.\d+)?', cleaned)
+        values = []
+        for n in nums:
+            try:
+                val = float(n.replace(',', ''))
+                if val > 1000:
+                    values.append(val)
+            except ValueError:
+                pass
+        if len(values) >= 3:
+            return values[0], values[1], values[2]
+        elif len(values) >= 1:
+            v = values[0]
+            return v, v, v
+    return None
+
+
+def _extract_cpechina3_ending(text):
+    """CPEChina Fund III — Ending Capital Account Balance."""
+    lines = text.split('\n')
+    for line in lines:
+        if not re.search(
+            r'Ending\s+Capital\s+Account\s+Balance',
+            line, re.IGNORECASE
+        ):
+            continue
+        if re.search(r'unfunded', line, re.IGNORECASE):
+            continue
+        nums = re.findall(r'[\d,]+(?:\.\d+)?', line)
+        values = []
+        for n in nums:
+            try:
+                val = float(n.replace(',', ''))
+                if val > 1000:
+                    values.append(val)
+            except ValueError:
+                pass
+        if len(values) >= 3:
+            return values[0], values[1], values[2]
+        elif len(values) >= 1:
+            v = values[0]
+            return v, v, v
+    return None
+
+
+def _extract_africa_ending(text):
+    """Africa Top Invest — two formats."""
+    lines = text.split('\n')
+
+    for line in lines:
+        if not re.search(
+            r'Estimated\s+Net\s+Asset\s+Value',
+            line, re.IGNORECASE
+        ):
+            continue
+        nums = re.findall(r'\$\s*([\d,]+(?:\.\d+)?)', line)
+        for n in nums:
+            try:
+                val = float(n.replace(',', ''))
+                if val > 100:
+                    return val
+            except ValueError:
+                pass
+        cleaned  = re.sub(r'\d{1,2}/\d{1,2}/\d{5,}', '', line)
+        cleaned  = _strip_date(_strip_percentages(cleaned))
+        nums_raw = _extract_numbers(cleaned)
+        nums_raw = [n for n in nums_raw if abs(n) > 1000]
+        if nums_raw:
+            return nums_raw[0]
+
+    for i, line in enumerate(lines):
+        if not re.search(
+            r'AFRICA\s+TOP\s+INVEST', line, re.IGNORECASE
+        ):
+            continue
+        for j in range(i + 1, min(i + 8, len(lines))):
+            if not re.search(
+                r'Capital\s+Called.*NAV\s+Total\s+Valuation',
+                lines[j], re.IGNORECASE
+            ):
+                continue
+            if j + 1 < len(lines):
+                data_line = lines[j + 1].strip()
+                nums = _extract_numbers(data_line)
+                nums = [n for n in nums if abs(n) > 100]
+                if nums:
+                    return nums[-1]
+
+    return None
+
+
+def _extract_africa_beginning(text):
+    """Africa Top Invest — no prior period data."""
+    return None
+
+
+def _extract_africa_commitment(text):
+    """Africa Top Invest LBO France — commitment."""
+    lines = text.split('\n')
+    for i, line in enumerate(lines):
+        if not re.search(
+            r'AFRICA\s+TOP\s+INVEST', line, re.IGNORECASE
+        ):
+            continue
+        for j in range(i + 1, min(i + 5, len(lines))):
+            if not re.search(
+                r'Commitment\s+Remaining\s+Commitment',
+                lines[j], re.IGNORECASE
+            ):
+                continue
+            if j + 1 < len(lines):
+                data = lines[j + 1].strip()
+                nums = re.findall(r'[\d,]+(?:\.\d+)?', data)
+                for n in nums:
+                    try:
+                        val = float(n.replace(',', ''))
+                        if val > 10000:
+                            return val
+                    except ValueError:
+                        pass
+    return None
+
+
+def _extract_simple_ending_balance(text):
+    """Metropolitan RE Global — Ending Capital Balance."""
+    lines = text.split('\n')
+    for line in lines:
+        if not re.search(
+            r'Ending\s+Capital\s+Balance',
+            line, re.IGNORECASE
+        ):
+            continue
+        nums = re.findall(r'\$\s*([\d,]+(?:\.\d+)?)', line)
+        if not nums:
+            cleaned  = _strip_date(_strip_percentages(line))
+            nums_raw = _extract_numbers(cleaned)
+            nums_raw = [n for n in nums_raw if abs(n) > 100]
+            if nums_raw:
+                return nums_raw[0]
+        for n in nums:
+            try:
+                val = float(n.replace(',', ''))
+                if val > 100:
+                    return val
+            except ValueError:
+                pass
+    return None
+
+
+def _extract_simple_beginning_balance(text):
+    """Metropolitan RE Global — Beginning Capital Balance."""
+    lines = text.split('\n')
+    for line in lines:
+        if not re.search(
+            r'Beginning\s+Capital\s+Balance',
+            line, re.IGNORECASE
+        ):
+            continue
+        nums = re.findall(r'\$\s*([\d,]+(?:\.\d+)?)', line)
+        if not nums:
+            cleaned  = _strip_date(_strip_percentages(line))
+            nums_raw = _extract_numbers(cleaned)
+            nums_raw = [n for n in nums_raw if abs(n) > 100]
+            if nums_raw:
+                return nums_raw[0]
+        for n in nums:
+            try:
+                val = float(n.replace(',', ''))
+                if val > 100:
+                    return val
+            except ValueError:
+                pass
+    return None
+
+
+def _extract_partners_group_ending(text):
+    """Partners Group RE Secondary — Swiss number format."""
+    lines = text.split('\n')
+    for line in lines:
+        if not re.search(
+            r'EndingNAV|Ending\s+NAV|'
+            r'(?:Ending|Closing)\s+(?:capital|balance|NAV)',
+            line, re.IGNORECASE
+        ):
+            continue
+        if re.search(
+            r'beginning|opening|prior', line, re.IGNORECASE
+        ):
+            continue
+        normalized = _normalize_swiss_numbers(line)
+        cleaned    = _strip_date(_strip_percentages(normalized))
+        nums       = _extract_numbers(cleaned)
+        nums       = [n for n in nums if abs(n) > 100]
+        if nums:
+            return nums[0]
+    return None
+
+
+def _extract_partners_group_beginning(text):
+    """Partners Group — BeginningNAV / Beginning NAV."""
+    lines = text.split('\n')
+    for line in lines:
+        if not re.search(
+            r'BeginningNAV|Beginning\s+NAV|'
+            r'Beginning\s+(?:capital|balance|NAV)',
+            line, re.IGNORECASE
+        ):
+            continue
+        normalized = _normalize_swiss_numbers(line)
+        cleaned    = _strip_date(_strip_percentages(normalized))
+        nums       = _extract_numbers(cleaned)
+        nums       = [n for n in nums if abs(n) > 100]
+        if nums:
+            return nums[0]
+    return None
+
+
+def _extract_stonepeak_ending(text):
+    """Stonepeak / SREP — Ending NAV/Capital."""
+    lines = text.split('\n')
+    for line in lines:
+        if not re.search(
+            r'(?:Ending|Closing)\s+(?:NAV|Capital|Value)',
+            line, re.IGNORECASE
+        ):
+            continue
+        if re.search(r'beginning|opening', line, re.IGNORECASE):
+            continue
+        cleaned = _strip_date(_strip_percentages(line))
+        nums    = _extract_numbers(cleaned)
+        nums    = [n for n in nums if abs(n) > 100]
+        if nums:
+            return nums[-1]
+    return None
+
+
+def _extract_stonepeak_beginning(text):
+    """Stonepeak — Beginning NAV/Capital."""
+    lines = text.split('\n')
+    for line in lines:
+        if not re.search(
+            r'Beginning\s+(?:NAV|Capital|Value)',
+            line, re.IGNORECASE
+        ):
+            continue
+        cleaned = _strip_date(_strip_percentages(line))
+        nums    = _extract_numbers(cleaned)
+        nums    = [n for n in nums if abs(n) > 100]
+        if nums:
+            return nums[0]
+    return None
+
+
+def _extract_canaan_ending(text):
+    """
+    Canaan VIII/IX/X — Ending Partner's Capital.
+    Line: 'Ending Partner's Capital $10,255,863 $10,255,863'
+    Returns QTD value (first $ match).
+    Both columns are always identical so QTD == YTD.
+    """
+    lines = text.split('\n')
+    for line in lines:
+        if not re.search(
+            r"Ending\s+Partner.s\s+Capital\s+\$",
+            line, re.IGNORECASE
+        ):
+            continue
+        nums = re.findall(r'\$\s*([\d,]+(?:\.\d+)?)', line)
+        for n in nums:
+            try:
+                val = float(n.replace(',', ''))
+                if val > 100:
+                    return val
+            except ValueError:
+                pass
+    return None
+
+
+def _extract_canaan_beginning(text, col=0):
+    """
+    Canaan VIII/IX/X — Beginning Partner's Capital.
+    Line: 'Beginning Partner's Capital $ 9,922,155 $ 9,778,525'
+    col=0 -> QTD (first value)
+    col=1 -> YTD (second value)
+    No ITD column exists in these PDFs — returns None for col>=2.
+    """
+    if col >= 2:
+        return None
+    lines = text.split('\n')
+    for line in lines:
+        if not re.search(
+            r"Beginning\s+Partner.s\s+Capital\s+\$",
+            line, re.IGNORECASE
+        ):
+            continue
+        nums = re.findall(r'\$\s*([\d,]+(?:\.\d+)?)', line)
+        values = []
+        for n in nums:
+            try:
+                val = float(n.replace(',', ''))
+                if val > 100:
+                    values.append(val)
+            except ValueError:
+                pass
+        if len(values) > col:
+            return values[col]
+    return None
+
+
+def _extract_canaan_nii(text, col=0):
+    """
+    Canaan VIII/IX/X — Temporary Investment Gain/Loss.
+    Line examples:
+      'Temporary Investment Gain 871 2,797'
+      'Temporary Investment Loss (2,172) (4,999)'
+    col=0 -> QTD, col=1 -> YTD.
+    No ITD column — returns None for col>=2.
+    Skips any line prefixed with 'Cumulative' to avoid
+    hitting 'Cumulative Temporary Investment Income' in
+    the balance sheet section.
+    """
+    if col >= 2:
+        return None
+    lines = text.split('\n')
+    for line in lines:
+        # Must match the flow statement label exactly
+        if not re.search(
+            r"Temporary\s+Investment\s+(?:Gain|Loss)",
+            line, re.IGNORECASE
+        ):
+            continue
+        # Hard guard — skip the balance sheet cumulative line
+        if re.search(r'\bCumulative\b', line, re.IGNORECASE):
+            continue
+        nums = _extract_numbers(line)
+        if len(nums) > col:
+            return nums[col]
+    return None
+
+
+def _extract_canaan_distributions(text, col=0):
+    """
+    Canaan VIII/X — Distributions row.
+    Line: 'Distributions - (346,901)'
+    QTD is a dash (zero/None), YTD is the negative value.
+    col=0 -> QTD (None — dash means no distribution this quarter)
+    col=1 -> YTD (negative value)
+    No ITD column — returns None for col>=2.
+    Skips 'Cumulative Distributions' balance sheet lines.
+    """
+    if col >= 2:
+        return None
+    lines = text.split('\n')
+    for line in lines:
+        if not re.search(
+            r"^\s*Distributions\s",
+            line, re.IGNORECASE
+        ):
+            continue
+        # Skip balance sheet cumulative lines
+        if re.search(r'\bCumulative\b', line, re.IGNORECASE):
+            continue
+        # QTD is a dash — no distribution this quarter
+        if col == 0:
+            return None
+        # YTD — extract all numbers, return first negative
+        nums = _extract_numbers(line)
+        neg = [n for n in nums if n < 0]
+        if neg:
+            return neg[0]
+    return None
+
+
+def _extract_sorenson_ending(text):
+    """Sorenson — Ending Capital $ QTD YTD ITD."""
+    lines = text.split('\n')
+    for line in lines:
+        if not re.search(
+            r"Ending\s+Capital\s+\$", line, re.IGNORECASE
+        ):
+            continue
+        nums = re.findall(r'\$\s*([\d,]+(?:\.\d+)?)', line)
+        values = []
+        for n in nums:
+            try:
+                val = float(n.replace(',', ''))
+                if val > 100:
+                    values.append(val)
+            except ValueError:
+                pass
+        if len(values) >= 3:
+            return values[0], values[1], values[2]
+        elif len(values) >= 1:
+            v = values[0]
+            return v, v, v
+    return None
+
+
+def _extract_sorenson_beginning(text):
+    """Sorenson — Beginning Capital $."""
+    lines = text.split('\n')
+    for line in lines:
+        if not re.search(
+            r"Beginning\s+Capital\s+\$", line, re.IGNORECASE
+        ):
+            continue
+        nums = re.findall(r'\$\s*([\d,]+(?:\.\d+)?)', line)
+        values = []
+        for n in nums:
+            try:
+                val = float(n.replace(',', ''))
+                if val > 100:
+                    values.append(val)
+            except ValueError:
+                pass
+        if values:
+            return values[0]
+    return None
+
+
+def _extract_dag_ending(text):
+    """DAG Ventures VI — Ending capital $."""
+    lines = text.split('\n')
+    for line in lines:
+        if not re.search(
+            r"Ending\s+capital\s+\$", line, re.IGNORECASE
+        ):
+            continue
+        nums = re.findall(r'\$\s*([\d,]+(?:\.\d+)?)', line)
+        for n in nums:
+            try:
+                val = float(n.replace(',', ''))
+                if val > 100:
+                    return val
+            except ValueError:
+                pass
+    return None
+
+
+def _extract_dag_beginning(text):
+    """DAG Ventures — Beginning capital $."""
+    lines = text.split('\n')
+    for line in lines:
+        if not re.search(
+            r"Beginning\s+capital\s+\$", line, re.IGNORECASE
+        ):
+            continue
+        nums = re.findall(r'\$\s*([\d,]+(?:\.\d+)?)', line)
+        for n in nums:
+            try:
+                val = float(n.replace(',', ''))
+                if val > 100:
+                    return val
+            except ValueError:
+                pass
+    return None
+
+
+def _extract_rrj_ending(text):
+    """RRJ Capital — Partner's Capital, 31 December YYYY."""
+    lines = text.split('\n')
+    for i, line in enumerate(lines):
+        if not re.search(
+            r"Partner.s\s+Capital,\s+\d+\s+December\s+\d{4}",
+            line, re.IGNORECASE
+        ):
+            continue
+        cleaned = _strip_date(_strip_percentages(line))
+        nums    = _extract_numbers(cleaned)
+        nums    = [n for n in nums if abs(n) > 1000]
+        if nums:
+            return nums[-1]
+        if i + 1 < len(lines):
+            nums = _extract_numbers(lines[i + 1])
+            nums = [n for n in nums if abs(n) > 1000]
+            if nums:
+                return nums[0]
+    return None
+
+
+def _extract_rrj_beginning(text):
+    """RRJ Capital — Partner's Capital, 01 January."""
+    lines = text.split('\n')
+    for i, line in enumerate(lines):
+        if not re.search(
+            r"Partner.s\s+Capital,\s+\d+\s+January\s+\d{4}",
+            line, re.IGNORECASE
+        ):
+            continue
+        cleaned = _strip_date(line)
+        nums    = _extract_numbers(cleaned)
+        nums    = [n for n in nums if abs(n) > 1000]
+        if nums:
+            return nums[-1]
+        if i + 1 < len(lines):
+            nums = _extract_numbers(lines[i + 1])
+            nums = [n for n in nums if abs(n) > 1000]
+            if nums:
+                return nums[0]
+    return None
+
+
+def _extract_cvc_ending(text):
+    """CVC Capital Partners VIII — LP section ending."""
+    lines    = text.split('\n')
+    lp_start = 0
+
+    for i, line in enumerate(lines):
+        if re.search(
+            r"Partner.s\s+Capital\s+Portfolio\s+Advisors",
+            line, re.IGNORECASE
+        ):
+            lp_start = i
+            break
+
+    search_lines = (
+        lines[lp_start:lp_start + 40]
+        if lp_start > 0 else lines
+    )
+
+    for line in search_lines:
+        if not re.search(
+            r"Ending\s+Capital\s+Account\s*[-]",
+            line, re.IGNORECASE
+        ):
+            continue
+        fixed  = _rejoin_broken_numbers(line)
+        nums   = re.findall(r'€\s*([\d,]+(?:\.\d+)?)', fixed)
+        values = []
+        for n in nums:
+            try:
+                val = float(n.replace(',', ''))
+                if val > 100:
+                    values.append(val)
+            except ValueError:
+                pass
+        if values:
+            return values[0]
+
+    return None
+
+
+def _extract_cvc_beginning(text):
+    """CVC Capital — LP & CIP Interests 30th September."""
+    lines    = text.split('\n')
+    lp_start = 0
+
+    for i, line in enumerate(lines):
+        if re.search(
+            r"Partner.s\s+Capital\s+Portfolio\s+Advisors",
+            line, re.IGNORECASE
+        ):
+            lp_start = i
+            break
+
+    search_lines = (
+        lines[lp_start:lp_start + 40]
+        if lp_start > 0 else lines
+    )
+
+    for line in search_lines:
+        if not re.search(
+            r"LP\s+&\s+CIP\s+Interests", line, re.IGNORECASE
+        ):
+            continue
+        fixed  = _rejoin_broken_numbers(line)
+        nums   = re.findall(r'€\s*([\d,]+(?:\.\d+)?)', fixed)
+        values = []
+        for n in nums:
+            try:
+                val = float(n.replace(',', ''))
+                if val > 100:
+                    values.append(val)
+            except ValueError:
+                pass
+        if values:
+            return values[0]
+
+    return None
+
+
+def _extract_small_caps_ending(text):
+    """Small Caps — NAV A2 Units as of 31 December."""
+    lines = text.split('\n')
+    for line in lines:
+        if not re.search(
+            r"Net\s+Asset\s+Value\s+.+Units\s+as\s+of\s+"
+            r"(?:31\s+December|December\s+31)",
+            line, re.IGNORECASE
+        ):
+            continue
+        nums = _extract_numbers(
+            _strip_date(_strip_percentages(line))
+        )
+        nums = [n for n in nums if abs(n) > 1000]
+        if nums:
+            return nums[0]
+    return None
+
+
+def _extract_small_caps_beginning(text):
+    """Small Caps — NAV A2 Units as of 30 September."""
+    lines = text.split('\n')
+    for line in lines:
+        if not re.search(
+            r"Net\s+Asset\s+Value\s+.+Units\s+as\s+of\s+"
+            r"(?:30\s+September|September\s+30)",
+            line, re.IGNORECASE
+        ):
+            continue
+        nums = _extract_numbers(
+            _strip_date(_strip_percentages(line))
+        )
+        nums = [n for n in nums if abs(n) > 1000]
+        if nums:
+            return nums[0]
+    return None
+
+
+def _extract_sparring_ending(text):
+    """Sparring Capital — Net Asset Value of share class."""
+    lines = text.split('\n')
+    for i, line in enumerate(lines):
+        if not re.search(
+            r"Net\s+Asset\s+Value\s+of\s+the\s+share\s+class",
+            line, re.IGNORECASE
+        ):
+            continue
+        window = line
+        if i + 1 < len(lines):
+            window += ' ' + lines[i + 1]
+        normalized = _normalize_european_numbers(window)
+        nums = _extract_numbers(
+            _strip_date(_strip_percentages(normalized))
+        )
+        nums = [n for n in nums if abs(n) > 100]
+        if nums:
+            return nums[-1]
+    return None
+
+
+def _extract_sparring_beginning(text):
+    """Sparring Capital — Net Cumulative Drawdown."""
+    lines = text.split('\n')
+    for line in lines:
+        if not re.search(
+            r"Net\s+Cumulative\s+Drawdown", line, re.IGNORECASE
+        ):
+            continue
+        normalized = _normalize_european_numbers(line)
+        nums = _extract_numbers(
+            _strip_date(_strip_percentages(normalized))
+        )
+        nums = [n for n in nums if abs(n) > 100]
+        if nums:
+            return nums[-1]
+    return None
+
+
+def _extract_hampshire_ending(text):
+    """Hampshire Partners — PAREF VIII Secondaries row last."""
+    lines = text.split('\n')
+
+    for i, line in enumerate(lines):
+        if not re.search(
+            r'PAREF\s+VIII\s+Secondaries',
+            line, re.IGNORECASE
+        ):
+            continue
+        window = line
+        if i + 1 < len(lines):
+            window += ' ' + lines[i + 1]
+        nums = _extract_numbers(_strip_percentages(window))
+        nums = [n for n in nums if abs(n) > 100]
+        if nums:
+            return nums[-1]
+
+    for i, line in enumerate(lines):
+        if not re.match(r'\s*Total\s+\$', line, re.IGNORECASE):
+            continue
+        nums = _extract_numbers(_strip_percentages(line))
+        nums = [n for n in nums if abs(n) > 1000]
+        if len(nums) >= 2:
+            return nums[-1]
+
+    return None
+
+
+def _extract_hampshire_beginning(text):
+    """Hampshire Partners — PAREF VIII Secondaries row first."""
+    lines = text.split('\n')
+
+    for i, line in enumerate(lines):
+        if not re.search(
+            r'PAREF\s+VIII\s+Secondaries',
+            line, re.IGNORECASE
+        ):
+            continue
+        window = line
+        if i + 1 < len(lines):
+            window += ' ' + lines[i + 1]
+        nums = _extract_numbers(_strip_percentages(window))
+        nums = [n for n in nums if abs(n) > 100]
+        if nums:
+            return nums[0]
+
+    for i, line in enumerate(lines):
+        if not re.match(r'\s*Total\s+\$', line, re.IGNORECASE):
+            continue
+        nums = _extract_numbers(_strip_percentages(line))
+        nums = [n for n in nums if abs(n) > 1000]
+        if nums:
+            return nums[0]
+
+    return None
+
+
+def _extract_orchid_ending(text):
+    """Orchid Asia — sum both current-year partner capital values."""
+    import datetime
+    max_year = datetime.date.today().year
+    lines = text.split('\n')
+    total = 0.0
+    found = False
+
+    for line in lines:
+        if not re.search(
+            r"Partner.s\s+capital\s+as\s+of\s+"
+            r"December\s+31,\s+20\d{2}",
+            line, re.IGNORECASE
+        ):
+            continue
+        if re.search(
+            r'Remaining|commitment', line, re.IGNORECASE
+        ):
+            continue
+        # Dynamic: accept current year or the previous year
+        if not re.search(
+            r'(?:' + str(max_year) + r'|' + str(max_year - 1) + r')',
+            line
+        ):
+            continue
+        nums = re.findall(r'\$\s*([\d,]+(?:\.\d+)?)', line)
+        for n in nums:
+            try:
+                val = float(n.replace(',', ''))
+                if val > 100:
+                    total += val
+                    found  = True
+            except ValueError:
+                pass
+
+    return total if found else None
+
+
+def _extract_orchid_beginning(text):
+    """Orchid Asia — sum both prior-year partner capital values."""
+    import datetime
+    max_year = datetime.date.today().year
+    prior_year = max_year - 1
+    lines = text.split('\n')
+    total = 0.0
+    found = False
+
+    for line in lines:
+        if not re.search(
+            r"Partner.s\s+capital\s+as\s+of\s+"
+            r"December\s+31,\s+20\d{2}",
+            line, re.IGNORECASE
+        ):
+            continue
+        if re.search(
+            r'Remaining|commitment', line, re.IGNORECASE
+        ):
+            continue
+        # Dynamic: accept prior year only (beginning balance = prior year-end)
+        if not re.search(str(prior_year), line):
+            continue
+        nums = re.findall(r'\$\s*([\d,]+(?:\.\d+)?)', line)
+        for n in nums:
+            try:
+                val = float(n.replace(',', ''))
+                if val > 100:
+                    total += val
+                    found  = True
+            except ValueError:
+                pass
+
+    return total if found else None
+
+
+def _extract_fountainvest_ending(text):
+    """FountainVest — Closing Partner's Capital Balance."""
+    lines = text.split('\n')
+    for line in lines:
+        if not re.search(
+            r'Closing\s+Partner.s\s+Capital\s+Balance',
+            line, re.IGNORECASE
+        ):
+            continue
+        nums = re.findall(r'[\d,]+(?:\.\d+)?', line)
+        values = []
+        for n in nums:
+            try:
+                val = float(n.replace(',', ''))
+                if val > 1000:
+                    values.append(val)
+            except ValueError:
+                pass
+        if values:
+            return values[0]
+    return None
+
+
+def _extract_fountainvest_beginning(text):
+    """FountainVest — Opening Partner's Capital Balance."""
+    lines = text.split('\n')
+    for line in lines:
+        if not re.search(
+            r'Opening\s+Partner.s\s+Capital\s+Balance',
+            line, re.IGNORECASE
+        ):
+            continue
+        nums = re.findall(r'[\d,]+(?:\.\d+)?', line)
+        values = []
+        for n in nums:
+            try:
+                val = float(n.replace(',', ''))
+                if val > 1000:
+                    values.append(val)
+            except ValueError:
+                pass
+        if values:
+            return values[0]
+    return None
+
+
+def _extract_csim_ending(text):
+    """CSIM — last $ value on data row."""
+    lines = text.split('\n')
+    for i, line in enumerate(lines):
+        if not re.search(
+            r'Capital\s+Account\s+Balance\s+at',
+            line, re.IGNORECASE
+        ):
+            continue
+        for j in range(1, 5):
+            if i + j >= len(lines):
+                break
+            candidate = lines[i + j]
+            if not re.search(r'^\s*\$', candidate):
+                continue
+            nums = re.findall(
+                r'\$\s*([\d,]+(?:\.\d+)?)', candidate
+            )
+            values = []
+            for n in nums:
+                try:
+                    val = float(n.replace(',', ''))
+                    if val > 1000:
+                        values.append(val)
+                except ValueError:
+                    pass
+            if values:
+                return values[-1]
+    return None
+
+
+def _extract_csim_beginning(text):
+    """CSIM — first $ value on data row."""
+    lines = text.split('\n')
+    for i, line in enumerate(lines):
+        if not re.search(
+            r'Capital\s+Account\s+Balance\s+at',
+            line, re.IGNORECASE
+        ):
+            continue
+        for j in range(1, 5):
+            if i + j >= len(lines):
+                break
+            candidate = lines[i + j]
+            if not re.search(r'^\s*\$', candidate):
+                continue
+            nums = re.findall(
+                r'\$\s*([\d,]+(?:\.\d+)?)', candidate
+            )
+            values = []
+            for n in nums:
+                try:
+                    val = float(n.replace(',', ''))
+                    if val > 1000:
+                        values.append(val)
+                except ValueError:
+                    pass
+            if values:
+                return values[0]
+    return None
+
+
+def _extract_meadow_ending(text):
+    """Meadow RE — last $ value from Ending Loan Value."""
+    lines = text.split('\n')
+    for line in lines:
+        if not re.search(
+            r'Ending\s+Loan\s+Value', line, re.IGNORECASE
+        ):
+            continue
+        nums = re.findall(r'\$\s*([\d,]+(?:\.\d+)?)', line)
+        values = []
+        for n in nums:
+            try:
+                val = float(n.replace(',', ''))
+                if val > 100:
+                    values.append(val)
+            except ValueError:
+                pass
+        if values:
+            return values[-1]
+    return None
+
+
+def _extract_meadow_beginning(text):
+    """Meadow RE — last $ value from Beginning Loan Value."""
+    lines = text.split('\n')
+    for line in lines:
+        if not re.search(
+            r'Beginning\s+Loan\s+Value', line, re.IGNORECASE
+        ):
+            continue
+        nums = re.findall(r'\$\s*([\d,]+(?:\.\d+)?)', line)
+        values = []
+        for n in nums:
+            try:
+                val = float(n.replace(',', ''))
+                values.append(val)
+            except ValueError:
+                pass
+        if values:
+            return values[-1]
+    return None
+
+
+def _extract_greenfield_ending(text):
+    """Greenfield — Fair Value of Capital last number."""
+    lines = text.split('\n')
+    for line in lines:
+        if not re.search(
+            r'Fair\s+Value\s+of\s+Capital', line, re.IGNORECASE
+        ):
+            continue
+        nums = _extract_numbers(_strip_date(line))
+        nums = [n for n in nums if abs(n) > 100]
+        if nums:
+            return nums[-1]
+    return None
+
+
+def _extract_greenfield_beginning(text):
+    """Greenfield — Capital Funded first large number."""
+    lines = text.split('\n')
+    for line in lines:
+        if not re.search(
+            r'Capital\s+Funded', line, re.IGNORECASE
+        ):
+            continue
+        nums = _extract_numbers(_strip_date(line))
+        nums = [n for n in nums if abs(n) > 1000]
+        if nums:
+            return nums[0]
+    return None
+
+
+def _extract_new_heritage_ending(text):
+    """New Heritage — value row last number."""
+    lines = text.split('\n')
+    for i, line in enumerate(lines):
+        if not re.search(r'12/31/20\d{2}\s*$', line.strip()):
+            continue
+        for j in range(1, 4):
+            if i + j >= len(lines):
+                break
+            candidate = lines[i + j].strip()
+            if not candidate:
+                continue
+            if re.search(
+                r'Quarter|Year|Capital Account|Balance at',
+                candidate, re.IGNORECASE
+            ):
+                continue
+            nums = _extract_numbers(candidate)
+            nums = [n for n in nums if abs(n) > 100]
+            if nums:
+                return nums[-1]
+    return None
+
+
+def _extract_new_heritage_beginning(text):
+    """New Heritage — value row first number."""
+    lines = text.split('\n')
+    for i, line in enumerate(lines):
+        if not re.search(
+            r'12/31/20\d{2}.*12/31/20\d{2}', line
+        ):
+            continue
+        for j in range(1, 4):
+            if i + j >= len(lines):
+                break
+            candidate = lines[i + j].strip()
+            if not candidate:
+                continue
+            if re.search(
+                r'Quarter|Year|Capital Account|Balance at',
+                candidate, re.IGNORECASE
+            ):
+                continue
+            nums = _extract_numbers(candidate)
+            nums = [n for n in nums if abs(n) > 100]
+            if nums:
+                return nums[0]
+    return None
+
+
+def _extract_platinum_totals(text):
+    """Platinum II/Continuation — Totals row second to last."""
+    lines = text.split('\n')
+    for i, line in enumerate(lines):
+        if not re.match(
+            r'\s*Totals?\s+\$', line, re.IGNORECASE
+        ):
+            continue
+        window = line
+        if i + 1 < len(lines):
+            window += ' ' + lines[i + 1]
+        cleaned = re.sub(r'\d+\.\d{4}%', '', window)
+        cleaned = _strip_date(cleaned)
+        nums    = _extract_numbers(cleaned)
+        if len(nums) >= 4:
+            return nums[-2]
+    return None
+
+
+def _extract_platinum_beginning(text):
+    """Platinum II/Continuation — Totals row nums[1]."""
+    lines = text.split('\n')
+    for i, line in enumerate(lines):
+        if not re.match(
+            r'\s*Totals?\s+\$', line, re.IGNORECASE
+        ):
+            continue
+        window = line
+        if i + 1 < len(lines):
+            window += ' ' + lines[i + 1]
+        cleaned = re.sub(r'\d+\.\d{4}%', '', window)
+        cleaned = _strip_date(cleaned)
+        nums    = _extract_numbers(cleaned)
+        if len(nums) >= 3:
+            return nums[1]
+    return None
+
+
+def _extract_platinum_ending(text):
+    """
+    Platinum III — ending values on separate lines.
+    Filter abs > 1000 to block partner numbers (8, 29).
+    """
+    lines = text.split('\n')
+    for i, line in enumerate(lines):
+        if not re.search(
+            r"Ending\s+Partners['']?\s+(?:Capital|Deficit)",
+            line, re.IGNORECASE
+        ):
+            continue
+        for j in range(1, 9):
+            if i + j >= len(lines):
+                break
+            candidate = lines[i + j]
+            if re.search(
+                r'Capital\s+as\s+of|Commitment|Partner\s*%|'
+                r'December|January|March|June|September|'
+                r'Resulting|Operations|Distributions|'
+                r'Contributions|Decrease|Increase',
+                candidate, re.IGNORECASE
+            ):
+                continue
+            nums = _extract_numbers(_strip_date(candidate))
+            nums = [n for n in nums if abs(n) > 1000]
+            if nums:
+                return nums[0]
+    return None
+
+
+def _extract_caltius_ending(text):
+    """Caltius — PASA VII row last number."""
+    lines = text.split('\n')
+
+    for i, line in enumerate(lines):
+        if not re.search(
+            r'Portfolio Advisors Secondary Aggregator VII',
+            line, re.IGNORECASE
+        ):
+            continue
+        window = line
+        if i + 1 < len(lines):
+            window += ' ' + lines[i + 1]
+        nums = _extract_numbers(_strip_date(window))
+        if nums:
+            return nums[-1]
+
+    for i, line in enumerate(lines):
+        if not re.match(r'\s*Total\s+\$', line, re.IGNORECASE):
+            continue
+        window  = line
+        if i + 1 < len(lines):
+            window += ' ' + lines[i + 1]
+        cleaned = re.sub(r'\d+\.\d{4}%', '', window)
+        nums    = _extract_numbers(_strip_date(cleaned))
+        if len(nums) >= 3:
+            return nums[-1]
+
+    return None
+
+
+def _deduplicate_values(values, tol=1.0):
+    unique = []
+    for v in values:
+        if not any(abs(v - u) <= tol for u in unique):
+            unique.append(v)
+    return unique
+
+
+# ══════════════════════════════════════════════════════════════
+# ROW EXTRACTOR — WITH ALL GUARDS
+# ══════════════════════════════════════════════════════════════
+
+def _extract_row(text, labels, col=0, guard_commitment=False):
+    """
+    Extract value from labelled row.
+
+    Guards:
+    1. Dedicated beginning parsers ONLY for beginning labels
+    2. Skip beginning/opening lines for flow searches
+    3. Skip cumulative/recallable/total/less summary lines
+    4. Skip single-negative commitment lines (guard_commitment)
+    """
+    is_beginning_search = col == 0 and any(
+        re.search(
+            r'beginning|opening|balance.*at.*\d{4}|'
+            r'Capital\s+Account\s+Balance\s+at|'
+            r'BeginningNAV|Beginning\s+NAV|'
+            r'Beginning\s+Loan|LP\s+&\s+CIP',
+            label, re.IGNORECASE
+        )
+        for label in labels
+    )
+
+    if is_beginning_search:
+        if re.search(
+            r'Hampshire\s+Partners', text, re.IGNORECASE
+        ):
+            val = _extract_hampshire_beginning(text)
+            if val is not None:
+                return val
+
+        if re.search(
+            r'PLATINUM\s+EQUITY\s+(?:CAPITAL\s+PARTNERS|'
+            r'CONTINUATION)',
+            text, re.IGNORECASE
+        ):
+            val = _extract_platinum_beginning(text)
+            if val is not None:
+                return val
+
+        if re.search(
+            r'New\s+Heritage\s+Capital', text, re.IGNORECASE
+        ):
+            val = _extract_new_heritage_beginning(text)
+            if val is not None:
+                return val
+
+        if re.search(r'ORCHID\s+ASIA', text, re.IGNORECASE):
+            val = _extract_orchid_beginning(text)
+            if val is not None:
+                return val
+
+        if re.search(r'FountainVest', text, re.IGNORECASE):
+            val = _extract_fountainvest_beginning(text)
+            if val is not None:
+                return val
+
+        if re.search(r'CSIM\s+Aligned', text, re.IGNORECASE):
+            val = _extract_csim_beginning(text)
+            if val is not None:
+                return val
+
+        if re.search(
+            r'Meadow\s+Real\s+Estate\s+Fund\s+V',
+            text, re.IGNORECASE
+        ):
+            val = _extract_meadow_beginning(text)
+            if val is not None:
+                return val
+
+        if re.search(
+            r'Greenfield\s+Land\s+Partners',
+            text, re.IGNORECASE
+        ):
+            val = _extract_greenfield_beginning(text)
+            if val is not None:
+                return val
+
+        if re.search(r'CANAAN', text, re.IGNORECASE):
+            val = _extract_canaan_beginning(text, col=col)
+            if val is not None:
+                return val
+
+        if re.search(
+            r'Sorenson\s+Capital', text, re.IGNORECASE
+        ):
+            val = _extract_sorenson_beginning(text)
+            if val is not None:
+                return val
+
+        if re.search(r'DAG\s+Ventures', text, re.IGNORECASE):
+            val = _extract_dag_beginning(text)
+            if val is not None:
+                return val
+
+        if re.search(r'RRJ\s+Capital', text, re.IGNORECASE):
+            val = _extract_rrj_beginning(text)
+            if val is not None:
+                return val
+
+        if re.search(
+            r'CVC\s+Capital\s+Partners\s+VIII',
+            text, re.IGNORECASE
+        ):
+            val = _extract_cvc_beginning(text)
+            if val is not None:
+                return val
+
+        if re.search(
+            r'SMALL\s+CAPS\s+OPPORTUNITIES',
+            text, re.IGNORECASE
+        ):
+            val = _extract_small_caps_beginning(text)
+            if val is not None:
+                return val
+
+        if re.search(
+            r'SPARRING\s+CAPITAL', text, re.IGNORECASE
+        ):
+            val = _extract_sparring_beginning(text)
+            if val is not None:
+                return val
+
+        if re.search(
+            r'Africa\s+Top\s+Invest', text, re.IGNORECASE
+        ):
+            val = _extract_africa_beginning(text)
+            if val is not None:
+                return val
+
+        if re.search(
+            r'MREP\s+Global|Metropolitan\s+RE\s+Global',
+            text, re.IGNORECASE
+        ):
+            val = _extract_simple_beginning_balance(text)
+            if val is not None:
+                return val
+
+        if re.search(
+            r'Partners\s+Group\s+Real\s+Estate\s+Secondary|'
+            r'RREF\s+Direct|PAREFVIIISECONDARIES',
+            text, re.IGNORECASE
+        ):
+            val = _extract_partners_group_beginning(text)
+            if val is not None:
+                return val
+
+        if re.search(
+            r'SREP\s+Port\s+Logistics|'
+            r'Stonepeak\s+Real\s+Estate\s+Associates',
+            text, re.IGNORECASE
+        ):
+            val = _extract_stonepeak_beginning(text)
+            if val is not None:
+                return val
+
+    is_flow_search = any(
+        re.search(
+            r'distribution|contribution|return\s+of',
+            label, re.IGNORECASE
+        )
+        for label in labels
+    )
+
+    lines = text.split('\n')
+    for label in labels:
+        for i, line in enumerate(lines):
+            if not re.search(label, line, re.IGNORECASE):
+                continue
+
+            # Guard 1: skip beginning/opening lines
+            if is_flow_search and re.search(
+                r'\bbeginning\b|\bopening\b|\bstarting\b',
+                line, re.IGNORECASE
+            ):
+                continue
+
+            # Guard 2: skip summary/recap lines
+            if is_flow_search and re.search(
+                r'\bCumulative\b|\bRecallable\b|'
+                r'\bTotal\s+(?:Distributions|Contributions)\b|'
+                r'^\s*Less\s+',
+                line, re.IGNORECASE
+            ):
+                continue
+
+            # Guard 3: skip single-negative commitment lines
+            if guard_commitment:
+                quick_nums = _extract_numbers(line)
+                if (len(quick_nums) == 1
+                        and quick_nums[0] < 0):
+                    continue
+
+            lookahead = 6 if re.search(
+                r'Partners|Beginning|Opening',
+                label, re.IGNORECASE
+            ) else 3
+            combined = line
+            for j in range(1, lookahead + 1):
+                if i + j < len(lines):
+                    combined += ' ' + lines[i + j]
+            combined = _strip_percentages(combined)
+            nums     = _extract_numbers(combined)
+            if len(nums) > col:
+                return nums[col]
+
+    return None
+
+
+# ══════════════════════════════════════════════════════════════
+# VALUE EXTRACTORS
+# ══════════════════════════════════════════════════════════════
+
+def _extract_commitment(text):
+    patterns = [
+        r'Total Commitment[:\s]*\$?\s*([\d,]+)',
+        r'Commitment\s+\$?\s*([\d,]+)',
+        r'Capital Commitment[:\s]*\$?\s*([\d,]+)',
+        r'Commitment Amount[:\s]*\$?\s*([\d,]+)',
+        r'Fund Commitment[:\s]*\$?\s*([\d,]+)',
+    ]
+    for p in patterns:
+        match = re.search(p, text, re.IGNORECASE)
+        if match:
+            return _clean_number(match.group(1))
+
+    africa_commit = _extract_africa_commitment(text)
+    if africa_commit is not None:
+        return africa_commit
+
+    return None
+
+
+def _extract_unfunded(text):
+    patterns = [
+        r'Unfunded[:\s]*\$?\s*([\d,]+)',
+        r'Uncalled[:\s]*\$?\s*([\d,]+)',
+        r'Remaining[:\s]*\$?\s*([\d,]+)',
+    ]
+    for p in patterns:
+        match = re.search(p, text, re.IGNORECASE)
+        if match:
+            val = _clean_number(match.group(1))
+            if val and val > 0:
+                return val
+    return None
+
+
+def _extract_ownership(text):
+    patterns = [
+        r'Ownership\s*%?[:\s]*([\d.]+)%',
+        r'Percentage of Fund[:\s]*([\d.]+)%',
+        r'%\s*of\s*(?:Total\s*)?Fund[:\s]*([\d.]+)%',
+        r'Interest[:\s]*([\d.]+)%',
+    ]
+    for p in patterns:
+        match = re.search(p, text, re.IGNORECASE)
+        if match:
+            try:
+                return float(match.group(1))
+            except ValueError:
+                pass
+    return None
+
+
+def _extract_irr(text):
+    match = re.search(
+        r'(?:Net\s+)?IRR[:\s]+([\d.]+)%',
+        text, re.IGNORECASE
+    )
+    if match:
+        try:
+            return float(match.group(1)) / 100
+        except ValueError:
+            pass
+    return None
+
+
+def _extract_moic(text):
+    match = re.search(
+        r'(?:TVPI|MOIC|Multiple)[:\s]+([\d.]+)x?',
+        text, re.IGNORECASE
+    )
+    if match:
+        try:
+            return float(match.group(1))
+        except ValueError:
+            pass
+    return None
+
+
+def _rejoin_broken_numbers(text):
+    """Fix pdfplumber space-insertion inside numbers."""
+    fixed = text
+    while True:
+        def _try_rejoin(m):
+            left   = m.group(1)
+            right  = m.group(2)
+            digits = len(left.replace(',', '') + right)
+            if digits > 15:
+                return m.group(0)
+            return left + right
+
+        new = re.sub(
+            r'(\d{1,3}(?:,\d{3})*,\d+)\s+(\d{1,2})'
+            r'(?=[\s,$)]|$)',
+            _try_rejoin,
+            fixed
+        )
+        if new == fixed:
+            break
+        fixed = new
+    return fixed
+
+
+def _extract_numbers(line):
+    """
+    Extract numeric values from a line.
+    Pre-processing: em/en-dash, double-dash,
+    targeted space-dash-space -> 0.
+    Filters: years 2000-2030, values > $500B.
+    """
+    line = re.sub(r'(?<!\w)[—–](?!\w)', ' 0 ', line)
+    line = re.sub(r'(?<!\w)--(?!\w)', ' 0 ', line)
+    line = re.sub(r'(?<=\s)-(?=\s\d)', ' 0 ', line)
+
+    line    = _rejoin_broken_numbers(line)
+    pattern = r'\([\d,]+(?:\.\d+)?\)|-?[\d,]+(?:\.\d+)?'
+    matches = re.findall(pattern, line)
+    numbers = []
+    for m in matches:
+        is_neg = m.startswith('(') and m.endswith(')')
+        clean  = re.sub(r'[()\s,]', '', m)
+        try:
+            val = float(clean)
+            if 2000.0 <= val <= 2030.0 and '.' not in m:
+                continue
+            if abs(val) > 500_000_000_000:
+                continue
+            numbers.append(-val if is_neg else val)
+        except ValueError:
+            continue
+    return numbers
+
+
+# ══════════════════════════════════════════════════════════════
+# STANDARD EXTRACTORS
+# ══════════════════════════════════════════════════════════════
+
+def _extract_fund_name(full_text, filename):
+    patterns = [
+        r'^([^\n]{5,60}(?:LP|L\.P\.|LLC|Fund|Partners)'
+        r'[^\n]{0,30})\n',
+        r'Fund[:\s]+([^\n]{5,60})',
+        r'^([A-Z][^\n]{5,60}(?:LP|L\.P\.|LLC))',
+    ]
+    for p in patterns:
+        match = re.search(
+            p, full_text, re.IGNORECASE | re.MULTILINE
+        )
+        if match:
+            name = match.group(1).strip()
+            skip = ['portfolio advisors', 'statement',
+                    'capital account', 'investor']
+            if not any(s in name.lower() for s in skip):
+                return name[:100]
+    name  = filename.replace('.pdf', '').replace('.PDF', '')
+    parts = name.split(' - ')
+    for part in reversed(parts):
+        part = part.strip()
+        if (part and 'PASA' not in part
+                and 'CAB' not in part
+                and len(part) > 5):
+            return part[:80]
+    return name[:80]
+
+
+def _extract_investor_name(full_text):
+    patterns = [
+        r'(?:Partner|Investor)[:\s]+'
+        r'(Portfolio Advisors[^\n]{5,80})',
+        r'(Portfolio Advisors Secondary Aggregator[^\n]{5,50})',
+        r'(Portfolio Advisors[^\n]{5,80})',
+    ]
+    for p in patterns:
+        match = re.search(p, full_text, re.IGNORECASE)
+        if match:
+            return re.sub(
+                r'\s+', ' ', match.group(1).strip()
+            )[:150]
+    return ""
+
+
+def _extract_report_date(full_text):
+    _MONTH_PAT = (
+        r'(?:January|February|March|April|May|June|'
+        r'July|August|September|October|November|December)'
+    )
+    patterns = [
+        # "For the year/period ended <Month> DD, YYYY"
+        rf'For the.*?[Ee]nded\s+({_MONTH_PAT}\s+\d{{1,2}},\s+\d{{4}})',
+        # "As of / As Of <Month> DD, YYYY"
+        rf'(?:As of|As Of)\s+({_MONTH_PAT}\s+\d{{1,2}},\s+\d{{4}})',
+        # "Period / Year ... MM/DD/YYYY"
+        r'(?:Period|Year).*?(\d{1,2}/\d{1,2}/\d{4})',
+        # bare "<Month> DD, YYYY"
+        rf'({_MONTH_PAT}\s+\d{{1,2}},\s+\d{{4}})',
+        # bare MM/DD/YYYY
+        r'(\d{1,2}/\d{1,2}/\d{4})',
+    ]
+    for p in patterns:
+        match = re.search(p, full_text, re.IGNORECASE)
+        if match:
+            # group(1) for capturing patterns; group(0) for bare fallbacks
+            return (match.group(1) or match.group(0)).strip()
+    return None          # ← was: "December 31, 2025"
+
+
+def _clean_number(value_str):
+    if not value_str:
+        return None
+    s = str(value_str).strip()
+    if s in ['-', '--', '–', '—', '$-', '$ -', '']:
+        return 0.0
+    is_negative = '(' in s and ')' in s
+    s = re.sub(r'[\$,\s]', '', s)
+    s = s.replace('(', '').replace(')', '')
+    try:
+        return -float(s) if is_negative else float(s)
+    except ValueError:
+        return None
+
+
+# ══════════════════════════════════════════════════════════════
+# VALIDATION
+# ══════════════════════════════════════════════════════════════
+
+def _validate_result(result):
+    notes = []
+    has_ending = any([
+        result.get("Ending Balance QTD") is not None,
+        result.get("Ending Balance YTD") is not None,
+        result.get("Ending Balance ITD") is not None,
+    ])
+    has_beginning = any([
+        result.get("Beginning Balance QTD") is not None,
+        result.get("Beginning Balance YTD") is not None,
+        result.get("Contributions ITD")     is not None,
+        result.get("Capital Commitment")    is not None,
+    ])
+    if not has_ending:
+        notes.append("Missing ending balance")
+        result["Extraction Status"] = "PARTIAL"
+    elif not has_beginning:
+        notes.append("Missing beginning balance")
+        result["Extraction Status"] = "PARTIAL"
+    else:
+        result["Extraction Status"] = "SUCCESS"
+    result["Extraction Notes"] = " | ".join(notes)
+    return result
