@@ -1,0 +1,175 @@
+#!/usr/bin/env python3
+"""
+pdf_dump.py — Diagnostic dump for PDF extraction debugging.
+
+For every PDF in a given file or folder, produces a .txt report containing:
+  1. Plain text (pypdf) — what a naive extractor sees
+  2. Layout-preserved text (pdftotext -layout) — spatial structure intact
+  3. Word-level coordinates (pdfplumber) — exact x/y position of every word,
+     which is what you need to debug "wrong field grabbed the wrong number"
+     bugs. If your regex or proximity logic is grabbing the ITD value from
+     the Contributions block, the coordinate dump shows exactly why.
+  4. Extracted tables (pdfplumber) — if the PDF has real tables, this shows
+     rows/columns as pdfplumber parsed them.
+
+Usage:
+    python3 pdf_dump.py /path/to/file.pdf
+    python3 pdf_dump.py /path/to/folder_of_pdfs/
+    python3 pdf_dump.py /path/to/folder_of_pdfs/ --outdir /path/to/output
+
+Each PDF gets its own <name>_dump.txt in the output directory (default:
+./pdf_dumps/ next to where you run the script).
+"""
+
+import argparse
+import subprocess
+import sys
+from pathlib import Path
+
+try:
+    import pdfplumber
+except ImportError:
+    print("ERROR: pdfplumber not installed. Run: pip install pdfplumber --break-system-packages")
+    sys.exit(1)
+
+try:
+    from pypdf import PdfReader
+except ImportError:
+    print("ERROR: pypdf not installed. Run: pip install pypdf --break-system-packages")
+    sys.exit(1)
+
+
+def get_plain_text(pdf_path):
+    """Naive text extraction — same rough method a lot of simple scripts use."""
+    out = []
+    try:
+        reader = PdfReader(str(pdf_path))
+        for i, page in enumerate(reader.pages):
+            out.append(f"--- Page {i + 1} (pypdf plain) ---")
+            out.append(page.extract_text() or "[no text extracted]")
+    except Exception as e:
+        out.append(f"[pypdf extraction failed: {e}]")
+    return "\n".join(out)
+
+
+def get_layout_text(pdf_path):
+    """pdftotext -layout preserves column/table spatial alignment."""
+    try:
+        result = subprocess.run(
+            ["pdftotext", "-layout", str(pdf_path), "-"],
+            capture_output=True, text=True, timeout=60
+        )
+        if result.returncode != 0:
+            return f"[pdftotext failed: {result.stderr}]"
+        return result.stdout
+    except FileNotFoundError:
+        return "[pdftotext not found on system — install poppler-utils]"
+    except Exception as e:
+        return f"[pdftotext failed: {e}]"
+
+
+def get_word_coordinates(pdf_path):
+    """
+    Word-level x/y coordinates. This is the key diagnostic view: it tells you
+    exactly where on the page each word/number sits, so you can see whether
+    your regex/proximity logic is anchoring to the wrong block.
+    """
+    out = []
+    try:
+        with pdfplumber.open(str(pdf_path)) as pdf:
+            for i, page in enumerate(pdf.pages):
+                out.append(f"--- Page {i + 1} (word coordinates: text | x0 | top | x1 | bottom) ---")
+                words = page.extract_words()
+                if not words:
+                    out.append("[no words found on this page]")
+                    continue
+                for w in words:
+                    out.append(
+                        f"{w['text']!r:30s} x0={w['x0']:.1f} top={w['top']:.1f} "
+                        f"x1={w['x1']:.1f} bottom={w['bottom']:.1f}"
+                    )
+    except Exception as e:
+        out.append(f"[pdfplumber word extraction failed: {e}]")
+    return "\n".join(out)
+
+
+def get_tables(pdf_path):
+    """Extract tables as pdfplumber sees them — rows and columns."""
+    out = []
+    try:
+        with pdfplumber.open(str(pdf_path)) as pdf:
+            for i, page in enumerate(pdf.pages):
+                tables = page.extract_tables()
+                if not tables:
+                    continue
+                out.append(f"--- Page {i + 1}: {len(tables)} table(s) found ---")
+                for t_idx, table in enumerate(tables):
+                    out.append(f"[Table {t_idx + 1}]")
+                    for row in table:
+                        out.append(" | ".join(cell if cell else "" for cell in row))
+                    out.append("")
+    except Exception as e:
+        out.append(f"[pdfplumber table extraction failed: {e}]")
+    if not out:
+        out.append("[no tables detected by pdfplumber]")
+    return "\n".join(out)
+
+
+def dump_pdf(pdf_path, outdir):
+    pdf_path = Path(pdf_path)
+    print(f"Processing: {pdf_path.name}")
+
+    sections = []
+    sections.append(f"{'=' * 80}\nPDF DIAGNOSTIC DUMP: {pdf_path.name}\n{'=' * 80}\n")
+
+    sections.append(f"\n{'#' * 80}\n# SECTION 1: PLAIN TEXT (pypdf) — naive extraction, no layout awareness\n{'#' * 80}\n")
+    sections.append(get_plain_text(pdf_path))
+
+    sections.append(f"\n\n{'#' * 80}\n# SECTION 2: LAYOUT TEXT (pdftotext -layout) — spatial structure preserved\n{'#' * 80}\n")
+    sections.append(get_layout_text(pdf_path))
+
+    sections.append(f"\n\n{'#' * 80}\n# SECTION 3: WORD COORDINATES (pdfplumber) — exact position of every word\n{'#' * 80}\n")
+    sections.append(get_word_coordinates(pdf_path))
+
+    sections.append(f"\n\n{'#' * 80}\n# SECTION 4: TABLES (pdfplumber) — parsed table structure, if any\n{'#' * 80}\n")
+    sections.append(get_tables(pdf_path))
+
+    outdir = Path(outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+    out_file = outdir / f"{pdf_path.stem}_dump.txt"
+    out_file.write_text("\n".join(sections), encoding="utf-8")
+    print(f"  -> {out_file}")
+    return out_file
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Dump diagnostic text/coordinate data from PDFs.")
+    parser.add_argument("input", help="Path to a single PDF or a folder of PDFs")
+    parser.add_argument("--outdir", default="./pdf_dumps", help="Output directory for dump .txt files")
+    args = parser.parse_args()
+
+    input_path = Path(args.input)
+    if not input_path.exists():
+        print(f"ERROR: {input_path} does not exist")
+        sys.exit(1)
+
+    if input_path.is_dir():
+        pdfs = sorted(input_path.glob("*.pdf")) + sorted(input_path.glob("*.PDF"))
+        if not pdfs:
+            print(f"No PDFs found in {input_path}")
+            sys.exit(1)
+    else:
+        pdfs = [input_path]
+
+    results = []
+    for pdf in pdfs:
+        try:
+            results.append(dump_pdf(pdf, args.outdir))
+        except Exception as e:
+            print(f"  FAILED on {pdf.name}: {e}")
+
+    print(f"\nDone. {len(results)} dump file(s) written to {Path(args.outdir).resolve()}")
+
+
+if __name__ == "__main__":
+    main()
