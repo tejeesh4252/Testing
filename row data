@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+"""
+row_reconstruct.py — Core shared primitive for the new extraction engine.
+
+Problem this solves:
+    pypdf/naive text extraction reads words in PDF content-stream order,
+    which frequently does NOT match visual/reading order. This causes
+    labels and their numeric values to end up on completely different
+    "lines" in the extracted text (confirmed on the Brockton fund file:
+    labels like "Amounts contributed" appeared with zero numbers nearby,
+    while the actual numbers sat 20+ lines earlier, unlabeled).
+
+Fix:
+    Use pdfplumber's word-level coordinates. Group words into rows by
+    vertical position (top, with a tolerance band to absorb minor
+    baseline jitter), then order each row's words left-to-right by x0.
+    This reconstructs the TRUE visual row regardless of content-stream
+    order — label and value end up in the same row object.
+
+This is a PRIMITIVE, not a full extractor. Next layer on top of this
+(not built yet) is header/column detection: find the header row, get
+each column's x-range, and assign each row's numbers to columns by
+position instead of by guessing index order.
+
+Usage:
+    python3 row_reconstruct.py /path/to/file.pdf
+    python3 row_reconstruct.py /path/to/file.pdf --page 1
+    python3 row_reconstruct.py /path/to/file.pdf --search "Amounts contributed"
+
+As a library:
+    from row_reconstruct import reconstruct_rows, row_text, find_rows_matching
+    pages = reconstruct_rows("file.pdf")
+    for row in pages[0]:
+        print(row_text(row))
+"""
+
+import argparse
+import sys
+from pathlib import Path
+
+try:
+    import pdfplumber
+except ImportError:
+    print("ERROR: pdfplumber not installed. Run: pip install pdfplumber --break-system-packages")
+    sys.exit(1)
+
+
+def reconstruct_rows(pdf_path, y_tolerance=3):
+    """
+    Groups words by vertical position into visual rows, ordered left-to-right.
+
+    Args:
+        pdf_path: path to the PDF file
+        y_tolerance: max difference in 'top' position (points) for two words
+                     to be considered on the same visual row. 3 works for most
+                     single-spaced tables; increase slightly (4-5) if a table
+                     uses larger line spacing and rows are splitting incorrectly.
+
+    Returns:
+        List (one entry per page) of lists of rows.
+        Each row is a list of word-dicts (pdfplumber's extract_words() output:
+        text, x0, x1, top, bottom), sorted left-to-right by x0.
+    """
+    rows_by_page = []
+    with pdfplumber.open(str(pdf_path)) as pdf:
+        for page in pdf.pages:
+            words = page.extract_words()
+            # Sort primarily by vertical position, then horizontal,
+            # so words on the same visual row cluster together.
+            words.sort(key=lambda w: (w['top'], w['x0']))
+
+            rows = []
+            current_row = []
+            current_top = None
+
+            for w in words:
+                if current_top is None or abs(w['top'] - current_top) <= y_tolerance:
+                    current_row.append(w)
+                    # Anchor to the FIRST word's top in this row, so tolerance
+                    # doesn't "drift" across many words in a wide row.
+                    if current_top is None:
+                        current_top = w['top']
+                else:
+                    current_row.sort(key=lambda x: x['x0'])
+                    rows.append(current_row)
+                    current_row = [w]
+                    current_top = w['top']
+
+            if current_row:
+                current_row.sort(key=lambda x: x['x0'])
+                rows.append(current_row)
+
+            rows_by_page.append(rows)
+
+    return rows_by_page
+
+
+def row_text(row, sep=' | '):
+    """Render a row (list of word-dicts) as a readable string."""
+    return sep.join(w['text'] for w in row)
+
+
+def find_rows_matching(rows, search_text, case_sensitive=False):
+    """
+    Find rows whose combined text contains search_text.
+    This is the row-aware replacement for 'search for label in raw text' —
+    label and its numbers are guaranteed to be in the SAME row object here,
+    so there's no lookahead-line-guessing needed.
+    """
+    matches = []
+    needle = search_text if case_sensitive else search_text.lower()
+    for row in rows:
+        text = row_text(row)
+        haystack = text if case_sensitive else text.lower()
+        if needle in haystack:
+            matches.append(row)
+    return matches
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Reconstruct true visual rows from a PDF using word coordinates."
+    )
+    parser.add_argument("pdf_path", help="Path to PDF file")
+    parser.add_argument("--page", type=int, default=None,
+                         help="Only show this page (1-indexed). Default: all pages.")
+    parser.add_argument("--search", default=None,
+                         help="Only show rows containing this text (case-insensitive)")
+    parser.add_argument("--y-tolerance", type=float, default=3,
+                         help="Row-clustering tolerance in points (default: 3)")
+    args = parser.parse_args()
+
+    pages = reconstruct_rows(args.pdf_path, y_tolerance=args.y_tolerance)
+
+    for page_num, rows in enumerate(pages, start=1):
+        if args.page is not None and page_num != args.page:
+            continue
+
+        if args.search:
+            rows = find_rows_matching(rows, args.search)
+            if not rows:
+                continue
+
+        print(f"\n{'=' * 70}\nPage {page_num}  ({len(rows)} rows)\n{'=' * 70}")
+        for row in rows:
+            print(row_text(row))
+
+
+if __name__ == "__main__":
+    main()
