@@ -1,0 +1,2284 @@
+"""
+BALBOA SMART MAPPING AGENT v3.5
+Monthly Transaction Processor + Cashbook Importer + DB Viewer
+- All v3.4 features preserved exactly
+- NEW: DB Viewer — browse Transaction History, Corrections, Summary stats
+"""
+
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox, scrolledtext
+import pandas as pd
+import openpyxl
+from openpyxl import load_workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+import sqlite3
+import os
+import sys
+import json
+import threading
+import shutil
+from copy import copy
+from datetime import datetime
+from fuzzywuzzy import fuzz
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+FUND_PROPERTY_MAP = {
+    "Fund I":   "brf1",
+    "Fund II":  "brf2f",
+    "Fund III": "brf3f"
+}
+
+BOOKNUM     = 1000
+SKIP_SHEETS = ["Summary", "ETL Sample", "COA"]
+CONFIG_FILE = "smart_mapper_config.json"
+DB_FILE     = "mappings_database.db"
+
+HEADER_ROWS = 9
+EXCLUDE_KEYWORDS = [
+    'BEGINNING BALANCE', 'ENDING BALANCE', 'CALCULATION', 'ACCRUAL',
+    'PAID', 'BALANCE', 'RUNNING', 'CASH BALANCE', 'CASH ENTRIES'
+]
+
+FUND_CONFIGS = {
+    "Fund I": {
+        'property_code': 'brf1',
+        'fund_name':     'Balboa Retail Fund I, L.P.',
+        'exclude_sheets': ['Summary', 'ETL Sample', 'COA'],
+        'cashbook':   r"C:\Users\wj596\Desktop\Personal\Automation\Balboa\Balboa Fund 1\BRFI Balboa Cash Book.xlsx",
+        'historical': r"C:\Users\wj596\Desktop\Personal\Automation\Balboa\Balboa Fund 1\Historical Data - Balboa Cash Book.xlsx",
+        'sheet_mapping': {
+            'CHASE_80003219615': 'JPM CHASE - 80003219615',
+            'BOFA_1453831338':   'BoFA - 1453831338',
+            'PNC_1087615896':    'PNC - 1087615896',
+            'PNC_1087664321':    'PNC - 1087664321'
+        },
+        'bank_normalization': {
+            'CHASE': 'CHASE', 'JPM': 'CHASE',
+            'BOFA': 'BOFA', 'BOA': 'BOFA', 'BANK OF AMERICA': 'BOFA',
+            'PNC': 'PNC'
+        }
+    },
+    "Fund II": {
+        'property_code': 'brf2f',
+        'fund_name':     'Balboa Retail Fund II, L.P.',
+        'exclude_sheets': ['Summary', 'ETL Sample', 'COA'],
+        'cashbook':   r"C:\Users\wj596\Desktop\Personal\Automation\Balboa\Balboa Fund 2\BRFII Balboa Cash Book.xlsx",
+        'historical': r"C:\Users\wj596\Desktop\Personal\Automation\Balboa\Balboa Fund 2\Historical Data - BRFII Balboa Cash Book.xlsx",
+        'sheet_mapping': {
+            'CHASE_80007962089': 'JPM CHASE - 80007962089',
+            'CHASE_1453538978':  'BoFA - 1453538978',
+            'CHASE_1087615909':  'PNC - 1087615909',
+            'CHASE_1087664436':  'PNC - 1087664436'
+        },
+        'bank_normalization': {
+            'CHASE': 'CHASE', 'JPM': 'CHASE',
+            'BOFA': 'CHASE', 'BOA': 'CHASE', 'BANK OF AMERICA': 'CHASE',
+            'PNC': 'CHASE'
+        }
+    },
+    "Fund III": {
+        'property_code': 'brf3f',
+        'fund_name':     'Balboa Retail Fund III, L.P.',
+        'exclude_sheets': ['Summary', 'ETL Sample', 'COA'],
+        'cashbook':   r"C:\Users\wj596\Desktop\Personal\Automation\Balboa\Balboa Fund 3\BRFIII Balboa Cash Book.xlsx",
+        'historical': r"C:\Users\wj596\Desktop\Personal\Automation\Balboa\Balboa Fund 3\Historical Data - BRFIII Balboa Cash Book.xlsx",
+        'sheet_mapping': {
+            'CHASE_689095811': 'JPM CHASE - 689095811',
+            'PNC_1087615917':  'PNC - 1087615917',
+            'PNC_1087664444':  'PNC - 1087664444'
+        },
+        'bank_normalization': {
+            'CHASE': 'CHASE', 'JPM': 'CHASE',
+            'PNC': 'PNC'
+        }
+    }
+}
+
+
+# ============================================================================
+# SMART MAPPER ENGINE  (v3.3 — unchanged)
+# ============================================================================
+
+class SmartMapper:
+
+    def __init__(self):
+        self.training_data = []
+        self.corrections   = {}
+        self.load_config()
+        self.init_db()
+
+    def load_config(self):
+        if os.path.exists(CONFIG_FILE):
+            with open(CONFIG_FILE, 'r') as f:
+                self.config = json.load(f)
+        else:
+            self.config = {
+                'high_threshold':   85,
+                'medium_threshold': 70
+            }
+
+    def init_db(self):
+        conn = sqlite3.connect(DB_FILE)
+        c    = conn.cursor()
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS corrections (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                description   TEXT,
+                gl_code       TEXT,
+                gl_name       TEXT,
+                corrected_at  TEXT
+            )
+        ''')
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS transaction_history (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                fund_name         TEXT,
+                property_code     TEXT,
+                sheet_name        TEXT,
+                bank_name         TEXT,
+                account_number    TEXT,
+                trans_date        TEXT,
+                post_month        TEXT,
+                amount            REAL,
+                bank_desc         TEXT,
+                bank_desc2        TEXT,
+                yardi_offset_acct TEXT,
+                gl_code_cash      TEXT,
+                archived_on       TEXT,
+                source_month      TEXT
+            )
+        ''')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_bank_desc    ON transaction_history(bank_desc)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_offset_acct  ON transaction_history(yardi_offset_acct)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_source_month ON transaction_history(source_month)')
+        conn.commit()
+        conn.close()
+
+    def load_training_data(self, filepath):
+        try:
+            xl       = pd.ExcelFile(filepath)
+            all_data = []
+            for sheet in xl.sheet_names:
+                try:
+                    df = pd.read_excel(filepath, sheet_name=sheet, dtype=str)
+                    df.columns = [str(c).strip() for c in df.columns]
+                    desc_col = next(
+                        (c for c in df.columns
+                         if c.lower() in ['je comments', 'description',
+                                          'transaction description',
+                                          'combined_desc']),
+                        None
+                    )
+                    gl_col   = next(
+                        (c for c in df.columns
+                         if c.lower() in ['yardi account #', 'gl code',
+                                          'gl_code', 'mapped_gl']),
+                        None
+                    )
+                    name_col = next(
+                        (c for c in df.columns
+                         if c.lower() in ['yardi account name', 'gl name',
+                                          'gl_name', 'mapped_name']),
+                        None
+                    )
+                    if desc_col and gl_col:
+                        for _, row in df.iterrows():
+                            desc = str(row.get(desc_col, '')).strip()
+                            gl   = str(row.get(gl_col,   '')).strip()
+                            name = str(row.get(name_col, '')).strip() if name_col else ''
+                            if (desc and gl
+                                    and desc not in ('nan', '')
+                                    and gl   not in ('nan', '')):
+                                all_data.append((desc, gl, name))
+                except Exception:
+                    continue
+            self.training_data = all_data
+            return len(all_data)
+        except Exception as e:
+            print(f"Training load error: {e}")
+            return 0
+
+    def load_corrections(self):
+        conn = sqlite3.connect(DB_FILE)
+        c    = conn.cursor()
+        c.execute('SELECT description, gl_code, gl_name FROM corrections')
+        rows = c.fetchall()
+        conn.close()
+        self.corrections = {r[0].lower(): (r[1], r[2]) for r in rows}
+
+    def save_correction(self, description, gl_code, gl_name):
+        conn = sqlite3.connect(DB_FILE)
+        c    = conn.cursor()
+        c.execute('''
+            INSERT INTO corrections (description, gl_code, gl_name, corrected_at)
+            VALUES (?, ?, ?, ?)
+        ''', (description.lower(), gl_code, gl_name,
+              datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+        conn.commit()
+        conn.close()
+        self.corrections[description.lower()] = (gl_code, gl_name)
+
+    def find_best_match(self, description):
+        if not description:
+            return None, None, 0, 'LOW'
+
+        desc_lower = description.lower()
+
+        # 1. exact correction
+        if desc_lower in self.corrections:
+            gl, name = self.corrections[desc_lower]
+            return gl, name, 100, 'HIGH'
+
+        # 2. fuzzy match
+        if not self.training_data:
+            return None, None, 0, 'LOW'
+
+        best_score  = 0
+        best_gl     = None
+        best_name   = None
+
+        for train_desc, gl, name in self.training_data:
+            score = fuzz.token_sort_ratio(desc_lower, train_desc.lower())
+            if score > best_score:
+                best_score = score
+                best_gl    = gl
+                best_name  = name
+
+        high = self.config.get('high_threshold',   85)
+        med  = self.config.get('medium_threshold', 70)
+
+        if best_score >= high:
+            conf = 'HIGH'
+        elif best_score >= med:
+            conf = 'MEDIUM'
+        else:
+            conf = 'LOW'
+
+        return best_gl, best_name, best_score, conf
+
+    def get_db_stats(self):
+        conn = sqlite3.connect(DB_FILE)
+        c    = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM transaction_history")
+        total = c.fetchone()[0]
+        c.execute("SELECT COUNT(DISTINCT source_month) FROM transaction_history")
+        months = c.fetchone()[0]
+        c.execute("SELECT COUNT(DISTINCT fund_name) FROM transaction_history")
+        funds = c.fetchone()[0]
+        c.execute("SELECT COUNT(DISTINCT yardi_offset_acct) "
+                  "FROM transaction_history WHERE yardi_offset_acct!=''")
+        accts = c.fetchone()[0]
+        c.execute("SELECT MIN(trans_date), MAX(trans_date) FROM transaction_history")
+        dr = c.fetchone()
+        conn.close()
+        return {
+            'total':    total,
+            'months':   months,
+            'funds':    funds,
+            'accts':    accts,
+            'earliest': dr[0] or 'N/A',
+            'latest':   dr[1] or 'N/A'
+        }
+
+    def archive_transactions(self, transactions, fund_name, source_month):
+        property_code = FUND_PROPERTY_MAP.get(fund_name, '')
+        conn          = sqlite3.connect(DB_FILE)
+        c             = conn.cursor()
+        inserted = skipped = 0
+        for txn in transactions:
+            if txn.get('status') == 'SKIP':
+                continue
+            trans_date = str(txn.get('date', ''))
+            bank_desc  = str(txn.get('bank_desc',  ''))
+            amount     = txn.get('amount', 0)
+            c.execute(
+                "SELECT id FROM transaction_history "
+                "WHERE fund_name=? AND trans_date=? AND bank_desc=? AND amount=?",
+                (fund_name, trans_date, bank_desc, amount)
+            )
+            if c.fetchone():
+                skipped += 1
+                continue
+            c.execute('''
+                INSERT INTO transaction_history
+                    (fund_name, property_code, sheet_name, bank_name,
+                     account_number, trans_date, post_month, amount,
+                     bank_desc, bank_desc2, yardi_offset_acct,
+                     gl_code_cash, archived_on, source_month)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ''', (
+                fund_name, property_code,
+                txn.get('sheet',         ''),
+                txn.get('bank_name',     ''),
+                txn.get('account_number',''),
+                trans_date,
+                txn.get('post_month',   ''),
+                amount,
+                bank_desc,
+                str(txn.get('bank_desc2',  '')),
+                str(txn.get('mapped_gl',   '')),
+                str(txn.get('bank_gl',     '')),
+                datetime.now().strftime('%Y-%m-%d'),
+                source_month
+            ))
+            inserted += 1
+        conn.commit()
+        conn.close()
+        return inserted, skipped
+
+
+# ============================================================================
+# TRANSACTION READER  (v3.3 — unchanged)
+# ============================================================================
+
+class TransactionReader:
+
+    @staticmethod
+    def _clean(val):
+        s = str(val).strip()
+        return '' if s in ('nan', 'None', 'NaN', ' ', '') else s
+
+    @staticmethod
+    def _is_gl_code(val):
+        s = str(val).strip()
+        return bool(s and s not in ('nan', 'None') and
+                    any(c.isdigit() for c in s))
+
+    def find_header_row(self, df_raw):
+        for idx, row in df_raw.iterrows():
+            vals = [str(v).strip().lower() for v in row.values]
+            if any(k in vals for k in ['post date', 'transaction date', 'date']):
+                return idx
+        return None
+
+    def get_bank_gl(self, df_raw):
+        limit = min(10, len(df_raw))
+        for idx in range(limit):
+            row = df_raw.iloc[idx]
+            for col_idx, val in enumerate(row.values):
+                if str(val).strip().lower() == 'gl - code':
+                    try:
+                        gl = str(row.values[col_idx + 1]).strip()
+                        if self._is_gl_code(gl):
+                            return gl
+                    except IndexError:
+                        pass
+        return None
+
+    @staticmethod
+    def build_combined(bank_desc, bank_desc2, manual_desc, je_comment):
+        bd  = bank_desc.strip()
+        bd2 = bank_desc2.strip()
+        md  = manual_desc.strip()
+        je  = je_comment.strip()
+        if je:
+            return je
+        if md:
+            if ' - ' in md:
+                return md
+            if bd and bd2:
+                return f"{bd} - {bd2}"
+            return md
+        if bd and bd2:
+            return f"{bd} - {bd2}"
+        return bd or bd2 or ''
+
+    def read_sheet(self, filepath, sheet_name):
+        try:
+            df_raw = pd.read_excel(filepath, sheet_name=sheet_name, header=None)
+        except Exception as e:
+            print(f"  ❌ Cannot open '{sheet_name}': {e}")
+            return [], None
+
+        bank_gl    = self.get_bank_gl(df_raw)
+        header_idx = self.find_header_row(df_raw)
+        if header_idx is None:
+            return [], bank_gl
+
+        df = pd.read_excel(filepath, sheet_name=sheet_name,
+                           header=header_idx, dtype=str)
+        df.columns = [str(c).strip() for c in df.columns]
+
+        print(f"  Columns  : {list(df.columns)}")
+        print(f"  Bank GL  : {bank_gl}")
+
+        def gcol(*names):
+            for n in names:
+                if n in df.columns:
+                    return n
+            return None
+
+        col_date   = gcol('Post Date', 'Transaction Date', 'Date', 'post date')
+        col_amt    = gcol('Transaction Amount', 'Amount', 'Debit', 'Credit')
+        col_bd     = gcol('Transaction Description', 'Bank Description',
+                          'Description', 'Narration')
+        col_bd2    = gcol('Transaction Description 2', 'Description 2')
+        col_md     = gcol('Manual Description', 'Manual Desc')
+        col_je     = gcol('JE comments', 'JE Comments', 'Comments')
+        col_exgl   = gcol('Yardi Account #', 'GL Code', 'GL Account')
+        col_exname = gcol('Yardi Account name', 'GL Name', 'Account Name')
+
+        if not col_date:
+            print(f"  ❌ No date column in '{sheet_name}'")
+            return [], bank_gl
+
+        transactions  = []
+        skipped_date  = 0
+        skipped_amt   = 0
+
+        for _, row in df.iterrows():
+            raw_date = self._clean(row.get(col_date, ''))
+            if not raw_date:
+                skipped_date += 1
+                continue
+            try:
+                date_num = float(raw_date)
+                if date_num < 1000:
+                    skipped_date += 1
+                    continue
+            except (ValueError, TypeError):
+                try:
+                    dt       = pd.to_datetime(raw_date, dayfirst=False)
+                    date_num = (dt - pd.Timestamp('1899-12-30')).days
+                except Exception:
+                    skipped_date += 1
+                    continue
+
+            raw_amt = self._clean(row.get(col_amt, '') if col_amt else '')
+            try:
+                amount = float(str(raw_amt).replace(',', '').replace('(', '-').replace(')', ''))
+            except (ValueError, TypeError):
+                skipped_amt += 1
+                continue
+
+            bd       = self._clean(row.get(col_bd,   '') if col_bd   else '')
+            bd2      = self._clean(row.get(col_bd2,  '') if col_bd2  else '')
+            md       = self._clean(row.get(col_md,   '') if col_md   else '')
+            je       = self._clean(row.get(col_je,   '') if col_je   else '')
+            combined = self.build_combined(bd, bd2, md, je)
+
+            existing_gl = self._clean(row.get(col_exgl,   '') if col_exgl   else '')
+            existing_nm = self._clean(row.get(col_exname, '') if col_exname else '')
+            if existing_gl and not self._is_gl_code(existing_gl):
+                existing_gl = ''
+                existing_nm = ''
+
+            transactions.append({
+                'date':          date_num,
+                'amount':        amount,
+                'bank_desc':     bd,
+                'bank_desc2':    bd2,
+                'combined_desc': combined,
+                'comments':      je,
+                'existing_gl':   existing_gl or None,
+                'existing_name': existing_nm or None,
+                'bank_gl':       bank_gl,
+                'sheet':         sheet_name,
+            })
+
+        print(f"  ✅ {len(transactions)} transactions extracted "
+              f"(skipped: {skipped_date} bad dates, {skipped_amt} bad amounts)")
+        return transactions, bank_gl
+
+
+# ============================================================================
+# ETL EXPORTER  (v3.3 — unchanged)
+# ============================================================================
+
+class ETLExporter:
+
+    def export(self, mapped_transactions, fund_name, output_path):
+        property_code = FUND_PROPERTY_MAP.get(fund_name, 'brf1')
+        rows = []
+
+        # --- Group transactions by date first ---
+        from collections import defaultdict
+        transactions_by_date = defaultdict(list)
+
+        for txn in mapped_transactions:
+            if txn.get('status') == 'SKIP':
+                continue
+            if not txn.get('mapped_gl') or not txn.get('bank_gl'):
+                continue
+
+            date_val = txn['date']
+            try:
+                dt = pd.Timestamp('1899-12-30') + pd.Timedelta(days=int(date_val))
+                date_str = dt.strftime('%m/%d/%Y')
+                post_mon = dt.replace(day=1).strftime('%Y-%m')   # kept as string, converted to date in formatter
+                date_key = dt.date()
+            except Exception:
+                date_str = str(date_val)
+                post_mon = ''
+                date_key = date_val
+
+            transactions_by_date[date_key].append({
+                'date_str': date_str,
+                'post_mon': post_mon,
+                'amount': txn['amount'],
+                'bank_gl': txn['bank_gl'],
+                'offset_gl': txn['mapped_gl'],
+                'detail_note': txn.get('combined_desc', ''),
+            })
+
+        if not transactions_by_date:
+            return False, "No transactions to export"
+
+        # --- One TRANNUM per unique date ---
+        sorted_dates = sorted(transactions_by_date.keys())
+
+        for tran_num, date_key in enumerate(sorted_dates, start=1):
+            tran_str =  tran_num
+            for txn in transactions_by_date[date_key]:
+                rows.append([tran_str, txn['date_str'], property_code, txn['bank_gl'],
+                             txn['post_mon'], BOOKNUM, txn['amount'], txn['detail_note'],
+                             '', ''])
+                rows.append([tran_str, txn['date_str'], property_code, txn['offset_gl'],
+                             txn['post_mon'], BOOKNUM, -txn['amount'], txn['detail_note'],
+                             '', ''])
+
+        df_out = pd.DataFrame(rows, columns=[
+            'TRANNUM', 'DATE', 'PROPERTY', 'ACCOUNT',
+            'POSTMONTH', 'BOOKNUM', 'AMOUNT',
+            'REMARK', 'REF', 'DETAILNOTES'
+        ])
+
+        try:
+            with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+                pd.DataFrame([['FinJournals']]).to_excel(
+                    writer, sheet_name='ETL Export',
+                    index=False, header=False
+                )
+                df_out.to_excel(
+                    writer, sheet_name='ETL Export',
+                    index=False, startrow=1
+                )
+
+            # ── Post-process formatting ───────────────────────────────────
+            from openpyxl import load_workbook
+            from openpyxl.styles import PatternFill, Font, Alignment
+            from openpyxl.styles.numbers import FORMAT_DATE_DATETIME
+
+            wb = load_workbook(output_path)
+            ws = wb['ETL Export']
+
+            # ── Row 1 — "FinJournals" banner ──────────────────────────────
+            banner_fill = PatternFill(start_color='1F3864',
+                                      end_color='1F3864', fill_type='solid')
+            banner_font = Font(name='Segoe UI', bold=True,
+                               color='FFFFFF', size=11)
+            for cell in ws[1]:
+                cell.fill = banner_fill
+                cell.font = banner_font
+                cell.alignment = Alignment(horizontal='center',
+                                           vertical='center')
+
+            # ── Row 2 — column headers ────────────────────────────────────
+            header_fill = PatternFill(start_color='2E75B6',
+                                      end_color='2E75B6', fill_type='solid')
+            header_font = Font(name='Segoe UI', bold=True,
+                               color='FFFFFF', size=10)
+            for cell in ws[2]:
+                cell.fill = header_fill
+                cell.font = header_font
+                cell.alignment = Alignment(horizontal='center',
+                                           vertical='center')
+
+            # ── Data rows — fix POSTMONTH to 1st of month as a date ───────
+            #    Also format DATE and POSTMONTH columns as dates
+            for row in ws.iter_rows(min_row=3, max_row=ws.max_row):
+                for cell in row:
+                    # POSTMONTH is column 5 (index 4, col E)
+                    if cell.column == 5 and cell.value:
+                        try:
+                            # Parse "YYYY-MM" → first day of month datetime
+                            dt = datetime.strptime(str(cell.value), '%Y-%m')
+                            cell.value = dt
+                            cell.number_format = 'MM/DD/YYYY'
+                            cell.alignment = Alignment(horizontal='center')
+                        except Exception:
+                            pass
+
+                    # DATE is column 2 (col B) — ensure date format
+                    if cell.column == 2 and cell.value:
+                        cell.alignment = Alignment(horizontal='center')
+
+                    # AMOUNT is column 7 (col G) — number format
+                    if cell.column == 7 and cell.value not in ('', None):
+                        cell.number_format = '#,##0.00'
+                        cell.alignment = Alignment(horizontal='right')
+
+            # ── Column widths ─────────────────────────────────────────────
+            col_widths = {
+                1: 10,  # TRANNUM
+                2: 12,  # DATE
+                3: 8,  # PROPERTY
+                4: 14,  # ACCOUNT
+                5: 14,  # POSTMONTH
+                6: 10,  # BOOKNUM
+                7: 14,  # AMOUNT
+                8: 35,  # REMARK
+                9: 10,  # REF
+                10: 10,  # DETAILNOTES
+            }
+            for col_idx, width in col_widths.items():
+                ws.column_dimensions[
+                    ws.cell(1, col_idx).column_letter
+                ].width = width
+
+            wb.save(output_path)
+            wb.close()
+            # ─────────────────────────────────────────────────────────────
+
+            return True, f"Exported {len(sorted_dates)} journal entries ({len(rows) // 2} transactions)"
+        except Exception as e:
+            return False, str(e)
+
+
+# ============================================================================
+# IMPORTER HELPER FUNCTIONS
+# ============================================================================
+
+def _convert_to_datetime(value):
+    """Convert various date formats to datetime."""
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        for fmt in ['%m/%d/%Y', '%Y-%m-%d', '%d-%b-%Y', '%m-%d-%Y']:
+            try:
+                return datetime.strptime(value, fmt)
+            except ValueError:
+                continue
+    try:
+        num_val = float(value)
+        if 40000 <= num_val <= 50000:          # realistic Excel date range only
+            return pd.to_datetime('1899-12-30') + pd.Timedelta(days=int(num_val))
+    except Exception:
+        pass
+    return None
+
+
+def _get_earliest_date_from_file(df):
+    """Scan only col[0] for valid Excel date serials. Avoids misreading account numbers."""
+    dates = []
+    for _, row in df.iterrows():
+        val = row.iloc[0]
+        dt  = _convert_to_datetime(val)
+        if dt:
+            dates.append(dt)
+    return (min(dates), max(dates)) if dates else (None, None)
+
+
+def _get_date_range_from_cashbook(cashbook_path, sheet_mapping):
+    """Read date range already in the cashbook (col A of each account sheet)."""
+    try:
+        wb    = openpyxl.load_workbook(cashbook_path, data_only=True)
+        dates = []
+        for sn in sheet_mapping.values():
+            if sn not in wb.sheetnames:
+                continue
+            ws = wb[sn]
+            for r in range(HEADER_ROWS + 1, ws.max_row + 1):
+                cell = ws.cell(r, 1)
+                if cell.value is None:
+                    break
+                if isinstance(cell.value, datetime):
+                    dates.append(cell.value)
+        wb.close()
+        return (min(dates), max(dates)) if dates else (None, None)
+    except Exception:
+        return None, None
+
+
+def _is_valid_transaction_row(row):
+    date_val   = row.iloc[1] if len(row) > 1 else None
+    amount_val = row.iloc[2] if len(row) > 2 else None
+    desc_val   = str(row.iloc[4]).strip().upper() if len(row) > 4 and pd.notna(row.iloc[4]) else ""
+
+    if not _convert_to_datetime(date_val):
+        return False, "No valid date"
+
+    for keyword in EXCLUDE_KEYWORDS:
+        if keyword in desc_val:
+            return False, f"Excluded keyword: {keyword}"
+
+    if amount_val is None or str(amount_val).strip() in ('', 'nan', 'None'):
+        return False, "No amount"
+
+    try:
+        float(amount_val)
+    except (ValueError, TypeError):
+        return False, "Amount not numeric"
+
+    return True, "Valid"
+
+
+def _get_existing_transactions(ws):
+    """Read (date, amount) pairs from cashbook sheet for duplicate detection."""
+    existing = set()
+    for r in range(HEADER_ROWS + 1, ws.max_row + 1):
+        date_cell   = ws.cell(r, 1).value
+        amount_cell = ws.cell(r, 2).value
+        if date_cell is None:
+            break
+        if isinstance(date_cell, datetime) and amount_cell is not None:
+            try:
+                existing.add((date_cell.date(), float(amount_cell)))
+            except (TypeError, ValueError):
+                pass
+    return existing
+
+
+def _identify_account_sections(df, bank_normalization):
+    accounts        = []
+    current_account = None
+
+    for idx, row in df.iterrows():
+        col1 = str(row.iloc[1]).strip().upper() if pd.notna(row.iloc[1]) and len(row) > 1 else ""
+        col2 = str(row.iloc[2]).strip()         if pd.notna(row.iloc[2]) and len(row) > 2 else ""
+        col3 = str(row.iloc[3]).strip()         if pd.notna(row.iloc[3]) and len(row) > 3 else ""
+
+        bank_norm = None
+        for key, val in bank_normalization.items():
+            if key in col1:
+                bank_norm = val
+                break
+
+        # Clean account number — handles float like 1087615896.0
+        try:
+            col2_clean = str(int(float(col2))).replace('-', '').replace(' ', '')
+            col2_str   = str(int(float(col2)))
+        except (ValueError, TypeError):
+            col2_clean = col2.replace('-', '').replace(' ', '')
+            col2_str   = col2
+
+        is_account_number = col2_clean.isdigit() and len(col2_clean) >= 6
+
+        if bank_norm and is_account_number:
+            if current_account and current_account['end_row'] is None:
+                current_account['end_row'] = idx - 1
+
+            current_account = {
+                'bank_name':      bank_norm,
+                'account_number': col2_str,
+                'account_type':   col3,
+                'start_row':      idx + 1,
+                'end_row':        None
+            }
+            accounts.append(current_account)
+
+    if current_account and current_account['end_row'] is None:
+        current_account['end_row'] = len(df) - 1
+
+    return accounts
+
+
+def _extract_account_data(df, account_info, log_fn):
+    start = account_info['start_row']
+    end   = account_info['end_row']
+    if end is None:
+        end = len(df) - 1
+
+    log_fn(f"  Extracting rows {start} to {end}")
+
+    sub   = df.iloc[start:end + 1].copy().dropna(how='all')
+    valid = []
+    excl  = 0
+
+    for _, row in sub.iterrows():
+        ok, reason = _is_valid_transaction_row(row)
+        if ok:
+            valid.append(row)
+        else:
+            excl += 1
+
+    log_fn(f"  Valid: {len(valid)}, Excluded: {excl}")
+    if not valid:
+        return pd.DataFrame(), {}
+
+    tdf = pd.DataFrame(valid)
+
+    # Keep col[1]=Date, col[2]=Amount, col[3]=Description, col[4]=Narrative
+    # Drop col[0] (always nan) — result: iloc[0]=Date, iloc[1]=Amount, iloc[2]=Desc, iloc[3]=Narrative
+    keep = [i for i in range(len(tdf.columns)) if i  not in [0, 4]]
+    tdf  = tdf.iloc[:, keep]
+
+    if not tdf.empty:
+        tdf.iloc[:, 0] = tdf.iloc[:, 0].apply(_convert_to_datetime)
+        tdf = tdf.sort_values(by=tdf.columns[0]).reset_index(drop=True)
+
+    activity = tdf.iloc[:, 1].astype(float).sum()
+    log_fn(f"  Activity: {activity:,.2f}")
+    return tdf, {'activity': activity}
+
+
+def _append_to_cashbook(transaction_df, sheet_name, cashbook_path, log_fn):
+    """Append valid rows to cashbook columns A–D. Returns (added, skipped)."""
+    log_fn(f"  Opening cashbook sheet: {sheet_name}")
+    wb = openpyxl.load_workbook(cashbook_path)
+
+    if sheet_name not in wb.sheetnames:
+        log_fn(f"  ❌ Sheet '{sheet_name}' not found!")
+        wb.close()
+        return 0, 0
+
+    ws       = wb[sheet_name]
+    existing = _get_existing_transactions(ws)
+    log_fn(f"  Existing transactions: {len(existing)}")
+
+    next_row = HEADER_ROWS + 1
+    while ws.cell(next_row, 1).value is not None:
+        next_row += 1
+
+    added   = 0
+    skipped = 0
+
+    for _, row in transaction_df.iterrows():
+        trans_date = row.iloc[0]
+        amount     = float(row.iloc[1])
+
+        if (trans_date.date(), amount) in existing:
+            log_fn(f"    SKIP (dup): {trans_date.date()} | {amount:,.2f}")
+            skipped += 1
+            continue
+
+        # Col A — Date
+        ws.cell(next_row, 1).value = trans_date
+        # Col B — Amount
+        ws.cell(next_row, 2).value = amount
+        # Col C — Bank Description (col[2] of source = Description)
+        if len(row) > 2 and pd.notna(row.iloc[2]):
+            ws.cell(next_row, 3).value = str(row.iloc[2])
+        # Col D — Bank Description 2 (col[3] of trimmed df = Label/narrative from col[4])
+        if len(row) > 3 and pd.notna(row.iloc[3]):
+            ws.cell(next_row, 4).value = str(row.iloc[3])
+
+        added    += 1
+        next_row += 1
+
+    wb.save(cashbook_path)
+    wb.close()
+    log_fn(f"  ✓ Added: {added} | Skipped (dups): {skipped}")
+    return added, skipped
+
+
+# ============================================================================
+# MAIN GUI APPLICATION  v3.5
+# ============================================================================
+
+class BalboaProcessorApp:
+
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Balboa Smart Mapping Agent v3.5")
+        self.root.geometry("1260x860")
+        self.root.configure(bg='#1e2433')
+
+        self.mapper   = SmartMapper()
+        self.reader   = TransactionReader()
+        self.exporter = ETLExporter()
+
+        self.transactions    = []
+        self.current_file    = None
+        self.current_fund    = tk.StringVar(value="Fund I")
+        self.training_loaded = False
+
+        self._import_source_file   = None
+        self._import_cashbook_file = None
+
+        self._setup_styles()
+        self._build_ui()
+
+    # ── styles ────────────────────────────────────────────────────────────────
+
+    def _setup_styles(self):
+        s    = ttk.Style()
+        s.theme_use('clam')
+        BG   = '#1e2433'
+        CARD = '#252d3d'
+
+        s.configure('Header.TFrame',  background=BG)
+        s.configure('Card.TFrame',    background=CARD)
+        s.configure('Header.TLabel',  background=BG,   foreground='white',
+                    font=('Segoe UI', 14, 'bold'))
+        s.configure('Sub.TLabel',     background=CARD,  foreground='#8892a4',
+                    font=('Segoe UI', 8))
+        s.configure('Value.TLabel',   background=CARD,  foreground='white',
+                    font=('Segoe UI', 18, 'bold'))
+        s.configure('Green.TLabel',   background=CARD,  foreground='#00d084',
+                    font=('Segoe UI', 18, 'bold'))
+        s.configure('Orange.TLabel',  background=CARD,  foreground='#f39c12',
+                    font=('Segoe UI', 18, 'bold'))
+        s.configure('Red.TLabel',     background=CARD,  foreground='#e74c3c',
+                    font=('Segoe UI', 18, 'bold'))
+        s.configure('Action.TButton', background='#3498db', foreground='white',
+                    font=('Segoe UI', 10, 'bold'), padding=8)
+        s.configure('Success.TButton', background='#00d084', foreground='white',
+                    font=('Segoe UI', 10, 'bold'), padding=8)
+        s.configure('Import.TButton',  background='#8e44ad', foreground='white',
+                    font=('Segoe UI', 10, 'bold'), padding=8)
+        s.configure('Treeview',
+                    background=CARD, foreground='white',
+                    fieldbackground=CARD, rowheight=24,
+                    font=('Segoe UI', 9))
+        s.configure('Treeview.Heading',
+                    background='#2e3a50', foreground='white',
+                    font=('Segoe UI', 9, 'bold'))
+        s.map('Treeview', background=[('selected', '#3b82f6')])
+
+    # ── stat helper ───────────────────────────────────────────────────────────
+
+    def _stat(self, parent, label, init, style):
+        f = ttk.Frame(parent, style='Card.TFrame')
+        f.pack(side='left', padx=6, ipadx=12, ipady=6)
+        sv = tk.StringVar(value=init)
+        ttk.Label(f, textvariable=sv, style=style).pack()
+        ttk.Label(f, text=label,      style='Sub.TLabel').pack()
+        return sv
+
+    # ── main UI ───────────────────────────────────────────────────────────────
+
+    def _build_ui(self):
+        BG = '#1e2433'
+
+        title_row = ttk.Frame(self.root, style='Header.TFrame')
+        title_row.pack(fill='x', padx=20, pady=(14, 4))
+
+        ttk.Label(
+            title_row,
+            text="🏦  BALBOA SMART MAPPING AGENT  v3.5",
+            style='Header.TLabel'
+        ).pack(side='left')
+
+        for fund in reversed(list(FUND_PROPERTY_MAP.keys())):
+            tk.Button(
+                title_row, text=fund,
+                bg='#3b82f6', fg='white',
+                font=('Segoe UI', 9, 'bold'),
+                relief='flat', padx=10, pady=4,
+                command=lambda f=fund: self.current_fund.set(f)
+            ).pack(side='right', padx=(0, 6))
+
+        stats = ttk.Frame(self.root, style='Card.TFrame')
+        stats.pack(fill='x', padx=20, pady=5)
+
+        self._sv_training = self._stat(stats, "Training Records", "0", 'Value.TLabel')
+        self._sv_total    = self._stat(stats, "Transactions",     "0", 'Value.TLabel')
+        self._sv_high     = self._stat(stats, "✅ Auto-Mapped",   "0", 'Green.TLabel')
+        self._sv_medium   = self._stat(stats, "⚠️ Review",        "0", 'Orange.TLabel')
+        self._sv_low      = self._stat(stats, "❌ Manual",        "0", 'Red.TLabel')
+        self._sv_db       = self._stat(stats, "🗄️ DB Records",    "0", 'Value.TLabel')
+
+        # Button row — mapping workflow
+        btn_row = ttk.Frame(self.root, style='Header.TFrame')
+        btn_row.pack(fill='x', padx=20, pady=8)
+
+        ttk.Button(
+            btn_row, text="📥  Import to Cashbook",
+            style='Import.TButton', command=self._open_import_panel
+        ).pack(side='left', padx=(0, 8))
+
+        ttk.Separator(btn_row, orient='vertical').pack(
+            side='left', fill='y', padx=12)
+
+        for txt, cmd in [
+            ("📂  Load Training Data", self.load_training),
+            ("📋  Upload Monthly File", self.upload_file),
+            ("🤖  Run Auto-Mapping", self.run_mapping),
+        ]:
+            ttk.Button(
+                btn_row, text=txt,
+                style='Action.TButton', command=cmd
+            ).pack(side='left', padx=(0, 8))
+
+        ttk.Button(
+            btn_row, text="💾  Export to Yardi",
+            style='Success.TButton', command=self.export_etl
+        ).pack(side='left', padx=(0, 8))
+
+        ttk.Button(
+            btn_row, text="💾  Save GL to Cashbook",
+            style='Action.TButton', command=self._save_gl_to_cashbook
+        ).pack(side='left', padx=(0, 8))
+
+        ttk.Button(
+            btn_row, text="🗄️  Archive Month",
+            style='Action.TButton', command=self._archive_month
+        ).pack(side='left', padx=(0, 8))
+
+        # ── DB Viewer button ──────────────────────────────────────────────────
+        ttk.Button(
+            btn_row, text="🗄️  DB Viewer",
+            style='Action.TButton', command=self._open_db_viewer
+        ).pack(side='left', padx=(0, 8))
+
+        self._status_var = tk.StringVar(
+            value="Step 1: Load training  →  "
+                  "Step 2: Upload monthly  →  "
+                  "Step 3: Run mapping  →  "
+                  "Step 4: Export to Yardi"
+        )
+        tk.Label(
+            self.root, textvariable=self._status_var,
+            bg=BG, fg='#8892a4', font=('Segoe UI', 9)
+        ).pack(anchor='w', padx=22)
+
+        tbl = ttk.Frame(self.root, style='Card.TFrame')
+        tbl.pack(fill='both', expand=True, padx=20, pady=(5, 5))
+
+        cols = (
+            'sheet', 'date', 'amount', 'combined_desc',
+            'mapped_gl', 'mapped_name', 'confidence', 'score', 'status'
+        )
+        self.tree = ttk.Treeview(
+            tbl, columns=cols,
+            show='headings', selectmode='browse'
+        )
+
+        col_cfg = [
+            ('sheet',        'Sheet',       80),
+            ('date',         'Date',        90),
+            ('amount',       'Amount',      90),
+            ('combined_desc','Description', 320),
+            ('mapped_gl',    'GL Code',     90),
+            ('mapped_name',  'GL Name',     160),
+            ('confidence',   'Confidence',  90),
+            ('score',        'Score',       60),
+            ('status',       'Status',      80),
+        ]
+        for cid, lbl, w in col_cfg:
+            self.tree.heading(cid, text=lbl)
+            self.tree.column(cid, width=w, minwidth=40)
+
+        self.tree.tag_configure('HIGH',     background='#1a3a2a', foreground='#00d084')
+        self.tree.tag_configure('MEDIUM',   background='#3a2e1a', foreground='#f39c12')
+        self.tree.tag_configure('LOW',      background='#3a1a1a', foreground='#e74c3c')
+        self.tree.tag_configure('EXISTING', background='#1a2a3a', foreground='#3b82f6')
+        self.tree.tag_configure('MANUAL',   background='#252d3d', foreground='white')
+
+        vsb = ttk.Scrollbar(tbl, orient='vertical',   command=self.tree.yview)
+        hsb = ttk.Scrollbar(tbl, orient='horizontal',  command=self.tree.xview)
+        self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+
+        vsb.pack(side='right',  fill='y')
+        hsb.pack(side='bottom', fill='x')
+        self.tree.pack(fill='both', expand=True)
+        self.tree.bind('<Double-1>', self._on_double_click)
+
+        self._refresh_db_stat()
+
+    def _set_status(self, msg):
+        self._status_var.set(msg)
+        self.root.update_idletasks()
+
+    def _refresh_db_stat(self):
+        try:
+            stats = self.mapper.get_db_stats()
+            self._sv_db.set(f"{stats['total']:,}")
+        except Exception:
+            pass
+
+    def _save_gl_to_cashbook(self):
+        """Write mapped GL codes back to cashbook columns E-F (Yardi GL + Name)."""
+        if not self.transactions:
+            messagebox.showwarning("No Data", "No transactions loaded.")
+            return
+        if not self.current_file:
+            messagebox.showwarning("No File", "No cashbook file loaded.")
+            return
+
+        mapped = [t for t in self.transactions if t.get('mapped_gl')]
+        if not mapped:
+            messagebox.showwarning("No Mappings", "Run Auto-Mapping first.")
+            return
+
+        try:
+            self._set_status("Saving GL mappings to cashbook…")
+            wb = openpyxl.load_workbook(self.current_file)
+            updated = 0
+
+            for txn in mapped:
+                sheet_name = txn.get('sheet')
+                if sheet_name not in wb.sheetnames:
+                    continue
+
+                ws = wb[sheet_name]
+                date_num = txn['date']
+                amount = txn['amount']
+
+                # Convert date serial to date for matching
+                try:
+                    txn_date = (pd.Timestamp('1899-12-30') +
+                                pd.Timedelta(days=int(date_num))).date()
+                except Exception:
+                    continue
+
+                # Scan rows to find matching date + amount
+                for r in range(HEADER_ROWS + 1, ws.max_row + 1):
+                    cell_date = ws.cell(r, 1).value
+                    cell_amount = ws.cell(r, 2).value
+
+                    if cell_date is None:
+                        break
+
+                    if isinstance(cell_date, datetime):
+                        row_date = cell_date.date()
+                    else:
+                        continue
+
+                    try:
+                        row_amount = float(cell_amount)
+                    except (TypeError, ValueError):
+                        continue
+
+                    if row_date == txn_date and abs(row_amount - amount) < 0.01:
+                        # Col E (5) = Yardi GL Offset Account
+                        # Col F (6) = Yardi Account Description
+                        ws.cell(r, 6).value = txn.get('mapped_gl', '')
+                        ws.cell(r, 7).value = txn.get('mapped_name', '')
+                        updated += 1
+                        break
+
+            wb.save(self.current_file)
+            wb.close()
+
+            self._set_status(f"✅ Saved {updated} GL mappings to cashbook.")
+            messagebox.showinfo("Saved",
+                                f"✅ {updated} GL mappings written to:\n"
+                                f"{os.path.basename(self.current_file)}")
+
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+            self._set_status("❌ Save GL failed.")
+
+    def _archive_month(self):
+        """
+        Append current month's mapped transactions to the master training file.
+        Columns written: Date, Amount, Bank Description, Bank Description 2,
+                         Combined Desc (JE Comments), Yardi Account #, Yardi Account Name
+        """
+        if not self.transactions:
+            messagebox.showwarning("No Data", "No transactions loaded.")
+            return
+
+        mapped = [t for t in self.transactions
+                  if t.get('mapped_gl') and t.get('status') != 'SKIP']
+        if not mapped:
+            messagebox.showwarning("Nothing to Archive",
+                                   "No mapped transactions found.\n"
+                                   "Run Auto-Mapping and review first.")
+            return
+
+        # Ask user where the master training file is
+        fp = filedialog.asksaveasfilename(
+            title="Select / Create Master Training File",
+            defaultextension=".xlsx",
+            filetypes=[("Excel files", "*.xlsx")],
+            initialfile="Balboa_Master_Training.xlsx"
+        )
+        if not fp:
+            return
+
+        try:
+            self._set_status("Archiving to training file…")
+
+            # Load existing or create new
+            if os.path.exists(fp):
+                wb = openpyxl.load_workbook(fp)
+            else:
+                wb = openpyxl.Workbook()
+                wb.remove(wb.active)  # remove default empty sheet
+
+            # Sheet name = current month  e.g. "2026-06"
+            try:
+                sample_date = (pd.Timestamp('1899-12-30') +
+                               pd.Timedelta(days=int(mapped[0]['date'])))
+                sheet_name = sample_date.strftime('%Y-%m')
+            except Exception:
+                sheet_name = datetime.now().strftime('%Y-%m')
+
+            # Create sheet (or clear if exists)
+            if sheet_name in wb.sheetnames:
+                del wb[sheet_name]
+            ws = wb.create_sheet(sheet_name)
+
+            # Write header
+            headers = [
+                'Post Date', 'Transaction Amount',
+                'Transaction Description', 'Transaction Description 2',
+                'JE comments',
+                'Yardi Account #', 'Yardi Account name'
+            ]
+            for col, h in enumerate(headers, start=1):
+                ws.cell(1, col).value = h
+
+            # Write rows
+            written = 0
+            for txn in mapped:
+                try:
+                    dt = (pd.Timestamp('1899-12-30') +
+                          pd.Timedelta(days=int(txn['date']))).strftime('%m/%d/%Y')
+                except Exception:
+                    dt = str(txn['date'])
+
+                ws.cell(written + 2, 1).value = dt
+                ws.cell(written + 2, 2).value = txn.get('amount', '')
+                ws.cell(written + 2, 3).value = txn.get('bank_desc', '')
+                ws.cell(written + 2, 4).value = txn.get('bank_desc2', '')
+                ws.cell(written + 2, 5).value = txn.get('combined_desc', '')
+                ws.cell(written + 2, 6).value = txn.get('mapped_gl', '')
+                ws.cell(written + 2, 7).value = txn.get('mapped_name', '')
+                written += 1
+
+            wb.save(fp)
+            wb.close()
+
+            # Also archive to DB
+            fund = self.current_fund.get()
+            source_month = sheet_name
+            ins, skp = self.mapper.archive_transactions(
+                self.transactions, fund, source_month)
+
+            self._set_status(
+                f"✅ Archived {written} rows to training file  │  "
+                f"DB: {ins} inserted, {skp} skipped"
+            )
+            messagebox.showinfo(
+                "Archive Complete",
+                f"✅ {written} transactions written to:\n"
+                f"{os.path.basename(fp)}\n\n"
+                f"Sheet: {sheet_name}\n"
+                f"DB records inserted: {ins}\n\n"
+                f"Load this file as Training Data next month for better matching."
+            )
+            self._refresh_db_stat()
+
+        except Exception as e:
+            messagebox.showerror("Archive Error", str(e))
+            self._set_status("❌ Archive failed.")
+
+    # ── actions ───────────────────────────────────────────────────────────────
+
+    def load_training(self):
+        fp = filedialog.askopenfilename(
+            title="Select Master Training File",
+            filetypes=[("Excel files", "*.xlsx *.xls")]
+        )
+        if not fp:
+            return
+        self._set_status("Loading training data…")
+        count = self.mapper.load_training_data(fp)
+        if count > 0:
+            self.training_loaded = True
+            self._sv_training.set(f"{count:,}")
+            self._set_status(
+                f"✅ {count:,} training records loaded.  "
+                f"Now upload your monthly cashbook."
+            )
+        else:
+            messagebox.showerror(
+                "Error",
+                "Could not load training data.\n"
+                "Make sure the file has 'JE comments' or 'Description' column."
+            )
+            self._set_status("❌ Training load failed.")
+
+    def upload_file(self):
+        fp = filedialog.askopenfilename(
+            title="Select Monthly Cashbook",
+            filetypes=[("Excel files", "*.xlsx *.xls")]
+        )
+        if not fp:
+            return
+        self.current_file = fp
+        self._set_status(f"Reading {os.path.basename(fp)}…")
+        try:
+            xl     = pd.ExcelFile(fp)
+            sheets = [s for s in xl.sheet_names if s not in SKIP_SHEETS]
+            self.transactions = []
+            loaded_sheets     = []
+            for sheet in sheets:
+                print(f"\n📋 Reading sheet: '{sheet}'")
+                txns, bank_gl = self.reader.read_sheet(fp, sheet)
+                if txns:
+                    self.transactions.extend(txns)
+                    loaded_sheets.append(f"{sheet} ({len(txns)} rows)")
+                else:
+                    print(f"  ⚠️  0 transactions in '{sheet}'")
+            total = len(self.transactions)
+            self._sv_total.set(f"{total:,}")
+            self._populate_table(show_mapping=False)
+            if total == 0:
+                self._set_status(
+                    "⚠️  File loaded but 0 transactions found. "
+                    "Check terminal for details."
+                )
+            else:
+                self._set_status(
+                    f"✅ {os.path.basename(fp)}  │  "
+                    f"Sheets: {', '.join(loaded_sheets)}  │  "
+                    f"Total: {total} rows  │  "
+                    f"Click 'Run Auto-Mapping'"
+                )
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not read file:\n{e}")
+            self._set_status("❌ File load failed.")
+
+    def run_mapping(self):
+        if not self.transactions:
+            messagebox.showwarning("No Data", "Please upload a monthly file first.")
+            return
+        if not self.training_loaded:
+            messagebox.showwarning("No Training Data",
+                                   "Please load the master training file first.")
+            return
+        self._set_status("Running auto-mapping…")
+        high = med = low = existing = 0
+        for txn in self.transactions:
+            if txn.get('existing_gl'):
+                txn['mapped_gl']   = txn['existing_gl']
+                txn['mapped_name'] = txn.get('existing_name', '')
+                txn['score']       = 100
+                txn['confidence']  = 'HIGH'
+                txn['status']      = 'EXISTING'
+                existing += 1
+                continue
+            desc = txn.get('combined_desc', '')
+            gl, name, score, conf = self.mapper.find_best_match(desc)
+            txn['mapped_gl']   = gl   or ''
+            txn['mapped_name'] = name or ''
+            txn['score']       = score
+            txn['confidence']  = conf
+            txn['status']      = 'MAPPED' if gl else 'UNMAPPED'
+            if conf == 'HIGH':
+                high += 1
+            elif conf == 'MEDIUM':
+                med  += 1
+            else:
+                low  += 1
+        self._sv_high.set(str(high + existing))
+        self._sv_medium.set(str(med))
+        self._sv_low.set(str(low))
+        self._populate_table(show_mapping=True)
+        self._set_status(
+            f"✅ Mapping complete  │  "
+            f"HIGH: {high}  MEDIUM: {med}  LOW: {low}  EXISTING: {existing}"
+        )
+
+    # ── export ────────────────────────────────────────────────────────────────
+
+    def export_etl(self):
+        if not self.transactions:
+            messagebox.showwarning("No Data", "No transactions to export.")
+            return
+
+        ready  = [t for t in self.transactions
+                  if t.get('mapped_gl') and t.get('status') != 'SKIP']
+        manual = [t for t in self.transactions
+                  if not t.get('mapped_gl') and t.get('status') != 'SKIP']
+
+        if manual:
+            ans = messagebox.askyesno(
+                "Unmapped Transactions",
+                f"⚠️  {len(manual)} transaction(s) have no GL code.\n\n"
+                f"Export the {len(ready)} mapped transactions only?\n"
+                "(Unmapped rows will be skipped)"
+            )
+            if not ans:
+                return
+
+        fund = self.current_fund.get()
+        fp   = filedialog.asksaveasfilename(
+            title="Save Yardi ETL File",
+            defaultextension=".xlsx",
+            filetypes=[("Excel files", "*.xlsx")],
+            initialfile=(
+                f"Yardi_ETL_"
+                f"{fund.replace(' ', '_')}_"
+                f"{datetime.now().strftime('%Y%m%d')}.xlsx"
+            )
+        )
+        if not fp:
+            return
+
+        ok, msg = self.exporter.export(ready, fund, fp)
+        if ok:
+            messagebox.showinfo("Export Complete", f"✅  {msg}\n\nSaved to:\n{fp}")
+            self._set_status(f"✅ Exported → {fp}")
+        else:
+            messagebox.showerror("Export Failed", msg)
+
+    # ── IMPORT PANEL (v3.4) ───────────────────────────────────────────────────
+
+    def _open_import_panel(self):
+        BG   = '#1e2433'
+        CARD = '#252d3d'
+
+        win = tk.Toplevel(self.root)
+        win.title("📥  Import Bank File → Cashbook")
+        win.geometry("820x640")
+        win.configure(bg=BG)
+        win.grab_set()
+
+        tk.Label(
+            win, text="📥  IMPORT BANK FILE TO CASHBOOK",
+            bg=BG, fg='white',
+            font=('Segoe UI', 14, 'bold')
+        ).pack(padx=20, pady=(16, 4), anchor='w')
+
+        tk.Label(
+            win,
+            text="Reads the bank source file, detects month, "
+                 "auto-archives previous month if needed, "
+                 "then appends new transactions to the cashbook.",
+            bg=BG, fg='#8892a4', font=('Segoe UI', 9), wraplength=780
+        ).pack(padx=20, anchor='w', pady=(0, 10))
+
+        fund_frame = tk.Frame(win, bg=CARD, padx=12, pady=10)
+        fund_frame.pack(fill='x', padx=20, pady=(0, 8))
+
+        tk.Label(fund_frame, text="Fund:",
+                 bg=CARD, fg='#8892a4',
+                 font=('Segoe UI', 10)).grid(row=0, column=0, sticky='w')
+
+        import_fund_var = tk.StringVar(value=self.current_fund.get())
+        ttk.Combobox(
+            fund_frame,
+            textvariable=import_fund_var,
+            values=list(FUND_CONFIGS.keys()),
+            width=16, state='readonly'
+        ).grid(row=0, column=1, padx=8, sticky='w')
+
+        files_frame = tk.Frame(win, bg=CARD, padx=12, pady=10)
+        files_frame.pack(fill='x', padx=20, pady=(0, 8))
+
+        src_lbl_var  = tk.StringVar(value="No file selected")
+        cash_lbl_var = tk.StringVar(value="No file selected")
+
+        def _pick_source():
+            fp = filedialog.askopenfilename(
+                title="Select Bank Source File",
+                filetypes=[("Excel files", "*.xlsx *.xls"), ("All files", "*.*")]
+            )
+            if fp:
+                self._import_source_file = fp
+                src_lbl_var.set(os.path.basename(fp))
+                _check_ready()
+
+        def _pick_cashbook():
+            fund_key = import_fund_var.get()
+            init     = FUND_CONFIGS.get(fund_key, {}).get('cashbook', '')
+            fp = filedialog.askopenfilename(
+                title="Select Cashbook File",
+                initialfile=init,
+                filetypes=[("Excel files", "*.xlsx"), ("All files", "*.*")]
+            )
+            if fp:
+                self._import_cashbook_file = fp
+                cash_lbl_var.set(os.path.basename(fp))
+                _check_ready()
+
+        btn_cfg = dict(bg='#3498db', fg='white',
+                       font=('Segoe UI', 9, 'bold'),
+                       relief='flat', padx=10, pady=4)
+
+        tk.Button(files_frame, text="📂  Source File",
+                  command=_pick_source, **btn_cfg
+                  ).grid(row=0, column=0, sticky='w', pady=4)
+        tk.Label(files_frame, textvariable=src_lbl_var,
+                 bg=CARD, fg='white',
+                 font=('Segoe UI', 9)
+                 ).grid(row=0, column=1, padx=10, sticky='w')
+
+        tk.Button(files_frame, text="📂  Cashbook File",
+                  command=_pick_cashbook, **btn_cfg
+                  ).grid(row=1, column=0, sticky='w', pady=4)
+        tk.Label(files_frame, textvariable=cash_lbl_var,
+                 bg=CARD, fg='white',
+                 font=('Segoe UI', 9)
+                 ).grid(row=1, column=1, padx=10, sticky='w')
+
+        run_btn = tk.Button(
+            win, text="▶  RUN IMPORT",
+            bg='#8e44ad', fg='white',
+            font=('Segoe UI', 11, 'bold'),
+            relief='flat', padx=20, pady=8,
+            state='disabled',
+            command=lambda: _start_import()
+        )
+        run_btn.pack(padx=20, pady=(0, 8), anchor='w')
+
+        def _check_ready():
+            if self._import_source_file and self._import_cashbook_file:
+                run_btn.config(state='normal')
+            else:
+                run_btn.config(state='disabled')
+
+        log_frame = tk.Frame(win, bg=CARD)
+        log_frame.pack(fill='both', expand=True, padx=20, pady=(0, 16))
+
+        tk.Label(log_frame, text="Import Log",
+                 bg=CARD, fg='#8892a4',
+                 font=('Segoe UI', 9, 'bold')
+                 ).pack(anchor='w', padx=6, pady=(6, 2))
+
+        log_box = scrolledtext.ScrolledText(
+            log_frame, height=18,
+            bg='#141924', fg='#c8d0dc',
+            insertbackground='white',
+            font=('Consolas', 9),
+            relief='flat'
+        )
+        log_box.pack(fill='both', expand=True, padx=6, pady=(0, 6))
+
+        def _log(msg):
+            log_box.insert(tk.END, msg + "\n")
+            log_box.see(tk.END)
+            log_box.update()
+
+        def _run_import_thread():
+            fund_key      = import_fund_var.get()
+            fund_cfg      = FUND_CONFIGS[fund_key]
+            source_path   = self._import_source_file
+            cashbook_path = self._import_cashbook_file
+
+            run_btn.config(state='disabled', text="⏳  IMPORTING…")
+
+            try:
+                _log("=" * 52)
+                _log(f"IMPORT STARTED  —  {fund_key}")
+                _log("=" * 52)
+                _log(f"Source  : {os.path.basename(source_path)}")
+                _log(f"Cashbook: {os.path.basename(cashbook_path)}")
+
+                _log("\nReading source file…")
+                df = pd.read_excel(source_path, sheet_name=0, header=None)
+                _log(f"Loaded  : {len(df)} rows, {len(df.columns)} cols")
+
+                df = pd.read_excel(source_path, sheet_name=0, header=None)
+                _log(f"Loaded  : {len(df)} rows, {len(df.columns)} cols")
+
+                _log("\n🔍 Checking date compatibility…")
+                f_early, f_late = _get_earliest_date_from_file(df)
+                c_early, c_late = _get_date_range_from_cashbook(
+                    cashbook_path, fund_cfg['sheet_mapping']
+                )
+
+                if f_early:
+                    _log(f"Source date range : {f_early.date()} → {f_late.date()}")
+                if c_early:
+                    _log(f"Cashbook date range: {c_early.date()} → {c_late.date()}")
+
+                # Identify bank account sections
+                _log("\nIdentifying account sections…")
+                accounts = _identify_account_sections(
+                    df, fund_cfg['bank_normalization']
+                )
+
+                if not accounts:
+                    _log("❌ No account sections found!")
+                    win.after(0, lambda: messagebox.showerror(
+                        "Error", "No account sections found in file.",
+                        parent=win
+                    ))
+                    return
+
+                _log(f"Found {len(accounts)} account(s)")
+                for acc in accounts:
+                    # Use the keys set by _identify_account_sections: 'bank', 'account_no'
+                    key = (f"{acc['bank_name']}_"
+                           f"{acc['account_number'].replace('-', '').replace(' ', '')}")
+                    acc['sheet_name'] = fund_cfg['sheet_mapping'].get(key, key)
+                    _log(f"  {acc['bank_name']} {acc['account_number']} "
+                         f"→ {acc['sheet_name']}")
+
+                # Process each account
+                _log("\nProcessing accounts…")
+                total_added   = 0
+                total_skipped = 0
+
+                for acc in accounts:
+                    _log(f"\n── {acc['bank_name']} {acc['account_number']} ──")
+                    data, stats = _extract_account_data(df, acc, _log)
+
+                    if data.empty:
+                        _log("  No data found")
+                        continue
+
+                    added, skipped = _append_to_cashbook(
+                        data,
+                        acc['sheet_name'],
+                        cashbook_path,
+                        _log
+                    )
+                    total_added   += added
+                    total_skipped += skipped
+
+                # Summary
+                _log("\n" + "=" * 52)
+                _log("IMPORT COMPLETE")
+                _log("=" * 52)
+                _log(f"  Rows imported  : {total_added}")
+                _log(f"  Duplicates     : {total_skipped}")
+
+                win.after(0, self._refresh_db_stat)
+                win.after(0, lambda: messagebox.showinfo(
+                    "Import Complete",
+                    f"✅  Import finished!\n\n"
+                    f"Rows imported  : {total_added}\n"
+                    f"Duplicates     : {total_skipped}",
+                    parent=win
+                ))
+
+            except Exception as e:
+                _log(f"\n❌ ERROR: {e}")
+            finally:
+                run_btn.config(state='normal', text="▶  RUN IMPORT")
+                self._refresh_db_stat()
+
+        def _start_import():
+            threading.Thread(target=_run_import_thread, daemon=True).start()
+
+    # ── DB VIEWER (new in v3.5) ───────────────────────────────────────────────
+
+    def _open_db_viewer(self):
+        BG   = '#1e2433'
+        CARD = '#252d3d'
+        HDR  = '#2e3a50'
+
+        win = tk.Toplevel(self.root)
+        win.title("🗄️  Balboa Database Viewer")
+        win.geometry("1100x700")
+        win.configure(bg=BG)
+        win.grab_set()
+
+        tk.Label(
+            win, text="🗄️  BALBOA DATABASE VIEWER",
+            bg=BG, fg='white', font=('Segoe UI', 14, 'bold')
+        ).pack(padx=20, pady=(14, 2), anchor='w')
+
+        tk.Label(
+            win, text=f"Database: {DB_FILE}",
+            bg=BG, fg='#8892a4', font=('Segoe UI', 9)
+        ).pack(padx=20, anchor='w', pady=(0, 8))
+
+        style = ttk.Style()
+        style.configure('DBViewer.TNotebook',        background=BG)
+        style.configure('DBViewer.TNotebook.Tab',
+                        background=HDR, foreground='white',
+                        font=('Segoe UI', 10, 'bold'), padding=[12, 5])
+        style.map('DBViewer.TNotebook.Tab',
+                  background=[('selected', '#3b82f6')],
+                  foreground=[('selected', 'white')])
+
+        nb = ttk.Notebook(win, style='DBViewer.TNotebook')
+        nb.pack(fill='both', expand=True, padx=16, pady=(0, 12))
+
+        # ── TAB 1 — SUMMARY ──────────────────────────────────────────────────
+        tab_summary = tk.Frame(nb, bg=BG)
+        nb.add(tab_summary, text='📊  Summary')
+
+        try:
+            conn = sqlite3.connect(DB_FILE)
+            c    = conn.cursor()
+            c.execute("SELECT COUNT(*) FROM transaction_history")
+            total_tx = c.fetchone()[0]
+            c.execute("SELECT COUNT(DISTINCT source_month) FROM transaction_history")
+            months = c.fetchone()[0]
+            c.execute("SELECT COUNT(DISTINCT fund_name) FROM transaction_history")
+            funds = c.fetchone()[0]
+            c.execute("SELECT COUNT(DISTINCT yardi_offset_acct) "
+                      "FROM transaction_history WHERE yardi_offset_acct!=''")
+            accts = c.fetchone()[0]
+            c.execute("SELECT MIN(trans_date), MAX(trans_date) FROM transaction_history")
+            dr = c.fetchone()
+            earliest = dr[0] or 'N/A'
+            latest   = dr[1] or 'N/A'
+            c.execute("SELECT COUNT(*) FROM corrections")
+            total_corr = c.fetchone()[0]
+            c.execute("SELECT fund_name, COUNT(*) FROM transaction_history "
+                      "GROUP BY fund_name ORDER BY COUNT(*) DESC")
+            fund_rows = c.fetchall()
+            c.execute("SELECT yardi_offset_acct, COUNT(*) FROM transaction_history "
+                      "WHERE yardi_offset_acct!='' "
+                      "GROUP BY yardi_offset_acct ORDER BY COUNT(*) DESC LIMIT 8")
+            top_gl = c.fetchall()
+            conn.close()
+
+            card_row = tk.Frame(tab_summary, bg=BG)
+            card_row.pack(fill='x', padx=20, pady=(16, 10))
+
+            def _card(parent, label, value, color='#3b82f6'):
+                f = tk.Frame(parent, bg=CARD, bd=0, relief='flat')
+                f.pack(side='left', padx=8, ipadx=16, ipady=10)
+                tk.Label(f, text=value, bg=CARD, fg=color,
+                         font=('Segoe UI', 22, 'bold')).pack()
+                tk.Label(f, text=label, bg=CARD, fg='#8892a4',
+                         font=('Segoe UI', 9)).pack()
+
+            _card(card_row, "Total Transactions",  f"{total_tx:,}",  '#3b82f6')
+            _card(card_row, "Months Archived",     f"{months}",      '#00d084')
+            _card(card_row, "Funds Tracked",       f"{funds}",       '#f39c12')
+            _card(card_row, "Unique GL Accounts",  f"{accts}",       '#a855f7')
+            _card(card_row, "Corrections Saved",   f"{total_corr}",  '#e74c3c')
+
+            tk.Label(
+                tab_summary,
+                text=f"📅  Date Range:  {earliest}  →  {latest}",
+                bg=BG, fg='#8892a4', font=('Segoe UI', 10)
+            ).pack(anchor='w', padx=28, pady=(0, 10))
+
+            lower = tk.Frame(tab_summary, bg=BG)
+            lower.pack(fill='both', expand=True, padx=20, pady=4)
+            lower.columnconfigure(0, weight=1)
+            lower.columnconfigure(1, weight=1)
+
+            lf = tk.LabelFrame(lower, text=' Fund Breakdown ',
+                               bg=BG, fg='white',
+                               font=('Segoe UI', 10, 'bold'))
+            lf.grid(row=0, column=0, sticky='nsew', padx=(0, 8), pady=4)
+            for fname, cnt in fund_rows:
+                row_f = tk.Frame(lf, bg=BG)
+                row_f.pack(fill='x', padx=10, pady=3)
+                tk.Label(row_f, text=fname, bg=BG, fg='white',
+                         font=('Segoe UI', 10), anchor='w').pack(side='left')
+                tk.Label(row_f, text=f"{cnt:,} records", bg=BG, fg='#3b82f6',
+                         font=('Segoe UI', 10, 'bold')).pack(side='right')
+
+            gf = tk.LabelFrame(lower, text=' Top GL Offset Accounts ',
+                               bg=BG, fg='white',
+                               font=('Segoe UI', 10, 'bold'))
+            gf.grid(row=0, column=1, sticky='nsew', padx=(8, 0), pady=4)
+            for gl, cnt in top_gl:
+                row_g = tk.Frame(gf, bg=BG)
+                row_g.pack(fill='x', padx=10, pady=3)
+                tk.Label(row_g, text=gl, bg=BG, fg='#f39c12',
+                         font=('Segoe UI', 10), anchor='w').pack(side='left')
+                tk.Label(row_g, text=f"{cnt}x", bg=BG, fg='white',
+                         font=('Segoe UI', 10)).pack(side='right')
+
+        except Exception as e:
+            tk.Label(tab_summary, text=f"❌ Could not load summary: {e}",
+                     bg=BG, fg='#e74c3c', font=('Segoe UI', 10)).pack(pady=20)
+
+        # ── TAB 2 — TRANSACTION HISTORY ───────────────────────────────────────
+        tab_tx = tk.Frame(nb, bg=BG)
+        nb.add(tab_tx, text='📋  Transaction History')
+
+        tx_filter = tk.Frame(tab_tx, bg=BG)
+        tx_filter.pack(fill='x', padx=10, pady=(8, 4))
+
+        _tx_fund_var  = tk.StringVar(value='All')
+        _tx_month_var = tk.StringVar(value='All')
+        _tx_search_var = tk.StringVar()
+
+        tk.Label(tx_filter, text="Fund:", bg=BG, fg='white',
+                 font=('Segoe UI', 9)).pack(side='left')
+        _tx_fund_cb = ttk.Combobox(tx_filter, textvariable=_tx_fund_var,
+                                   values=['All'] + list(FUND_PROPERTY_MAP.keys()),
+                                   width=10, state='readonly')
+        _tx_fund_cb.pack(side='left', padx=(4, 12))
+
+        tk.Label(tx_filter, text="Month:", bg=BG, fg='white',
+                 font=('Segoe UI', 9)).pack(side='left')
+        _tx_month_cb = ttk.Combobox(tx_filter, textvariable=_tx_month_var,
+                                    width=12, state='readonly')
+        _tx_month_cb.pack(side='left', padx=(4, 12))
+
+        tk.Label(tx_filter, text="Search:", bg=BG, fg='white',
+                 font=('Segoe UI', 9)).pack(side='left')
+        tk.Entry(tx_filter, textvariable=_tx_search_var,
+                 bg='#252d3d', fg='white', insertbackground='white',
+                 width=24).pack(side='left', padx=(4, 12))
+
+        tk.Button(tx_filter, text="🔍  Filter",
+                  bg='#3b82f6', fg='white',
+                  font=('Segoe UI', 9, 'bold'), padx=8, pady=2,
+                  command=lambda: _refresh_tx()
+                  ).pack(side='left')
+
+        tx_cols    = ('id', 'fund_name', 'sheet_name', 'bank_name', 'account_number',
+                      'trans_date', 'post_month', 'amount', 'bank_desc', 'bank_desc2',
+                      'yardi_offset_acct', 'gl_code_cash', 'archived_on', 'source_month')
+        tx_col_lbl = ('ID', 'Fund', 'Sheet', 'Bank', 'Account',
+                      'Date', 'Post Month', 'Amount', 'Description', 'Description 2',
+                      'Yardi Offset', 'GL Cash', 'Archived On', 'Source Month')
+        tx_col_w   = (40, 80, 120, 60, 100,
+                      90, 80, 90, 200, 160,
+                      100, 90, 100, 90)
+
+        tx_frame = tk.Frame(tab_tx, bg=BG)
+        tx_frame.pack(fill='both', expand=True, padx=10, pady=(0, 4))
+
+        tx_vsb = ttk.Scrollbar(tx_frame, orient='vertical')
+        tx_hsb = ttk.Scrollbar(tx_frame, orient='horizontal')
+        tx_tree = ttk.Treeview(
+            tx_frame, columns=tx_cols, show='headings',
+            selectmode='browse',
+            yscrollcommand=tx_vsb.set, xscrollcommand=tx_hsb.set
+        )
+        tx_vsb.config(command=tx_tree.yview)
+        tx_hsb.config(command=tx_tree.xview)
+
+        for col, lbl, w in zip(tx_cols, tx_col_lbl, tx_col_w):
+            tx_tree.heading(col, text=lbl)
+            tx_tree.column(col, width=w, minwidth=40, anchor='w')
+
+        tx_tree.tag_configure('odd',  background='#252d3d', foreground='white')
+        tx_tree.tag_configure('even', background='#1e2433', foreground='white')
+        tx_vsb.pack(side='right',  fill='y')
+        tx_hsb.pack(side='bottom', fill='x')
+        tx_tree.pack(fill='both', expand=True)
+
+        def _load_tx_months():
+            try:
+                conn = sqlite3.connect(DB_FILE)
+                c    = conn.cursor()
+                c.execute("SELECT DISTINCT source_month FROM transaction_history "
+                          "WHERE source_month IS NOT NULL ORDER BY source_month DESC")
+                months = ['All'] + [r[0] for r in c.fetchall() if r[0]]
+                conn.close()
+                _tx_month_cb['values'] = months
+            except Exception:
+                pass
+
+        def _refresh_tx(*_):
+            fund   = _tx_fund_var.get()
+            month  = _tx_month_var.get()
+            search = _tx_search_var.get().strip().lower()
+            try:
+                conn   = sqlite3.connect(DB_FILE)
+                c      = conn.cursor()
+                query  = ("SELECT id, fund_name, sheet_name, bank_name, account_number, "
+                          "trans_date, post_month, amount, bank_desc, bank_desc2, "
+                          "yardi_offset_acct, gl_code_cash, archived_on, source_month "
+                          "FROM transaction_history WHERE 1=1")
+                params = []
+                if fund != 'All':
+                    query += " AND fund_name = ?"
+                    params.append(fund)
+                if month != 'All':
+                    query += " AND source_month = ?"
+                    params.append(month)
+                query += " ORDER BY trans_date DESC"
+                c.execute(query, params)
+                rows = c.fetchall()
+                conn.close()
+            except Exception as e:
+                messagebox.showerror("DB Error", str(e), parent=win)
+                return
+            if search:
+                rows = [r for r in rows
+                        if any(search in str(cell).lower() for cell in r)]
+            tx_tree.delete(*tx_tree.get_children())
+            for i, row in enumerate(rows):
+                tag  = 'odd' if i % 2 else 'even'
+                vals = list(row)
+                tx_tree.insert('', 'end', values=vals, tags=(tag,))
+
+        def _delete_tx_row():
+            sel = tx_tree.selection()
+            if not sel:
+                return
+            row_id = tx_tree.item(sel[0])['values'][0]
+            if not messagebox.askyesno("Confirm Delete",
+                                       f"Delete transaction ID {row_id}?",
+                                       parent=win):
+                return
+            try:
+                conn = sqlite3.connect(DB_FILE)
+                conn.execute("DELETE FROM transaction_history WHERE id=?", (row_id,))
+                conn.commit()
+                conn.close()
+                _refresh_tx()
+                self._refresh_db_stat()
+            except Exception as e:
+                messagebox.showerror("DB Error", str(e), parent=win)
+
+        def _export_tx():
+            rows = tx_tree.get_children()
+            if not rows:
+                messagebox.showwarning("No Data", "Nothing to export.", parent=win)
+                return
+            fp = filedialog.asksaveasfilename(
+                parent=win, title="Export Transaction History",
+                defaultextension=".xlsx",
+                filetypes=[("Excel files", "*.xlsx")],
+                initialfile=f"DB_TransactionHistory_{datetime.now().strftime('%Y%m%d')}.xlsx"
+            )
+            if not fp:
+                return
+            data = [tx_tree.item(r)['values'] for r in rows]
+            df   = pd.DataFrame(data, columns=tx_col_lbl)
+            try:
+                df.to_excel(fp, index=False)
+                messagebox.showinfo("Export Complete",
+                                    f"✅ Exported {len(data):,} rows to:\n{fp}",
+                                    parent=win)
+            except Exception as e:
+                messagebox.showerror("Export Error", str(e), parent=win)
+
+        tx_btn = tk.Frame(tab_tx, bg=BG)
+        tx_btn.pack(fill='x', padx=10, pady=(0, 8))
+
+        tk.Button(tx_btn, text="🔄  Refresh",
+                  bg='#3b82f6', fg='white',
+                  font=('Segoe UI', 9, 'bold'), padx=12, pady=4,
+                  command=lambda: [_load_tx_months(), _refresh_tx()]
+                  ).pack(side='left', padx=(0, 6))
+        tk.Button(tx_btn, text="📤  Export to Excel",
+                  bg='#00d084', fg='white',
+                  font=('Segoe UI', 9, 'bold'), padx=12, pady=4,
+                  command=_export_tx
+                  ).pack(side='left', padx=(0, 6))
+        tk.Button(tx_btn, text="🗑️  Delete Selected Row",
+                  bg='#e74c3c', fg='white',
+                  font=('Segoe UI', 9, 'bold'), padx=12, pady=4,
+                  command=_delete_tx_row
+                  ).pack(side='left', padx=(0, 6))
+
+        _load_tx_months()
+        _refresh_tx()
+
+        # ── TAB 3 — CORRECTIONS ───────────────────────────────────────────────
+        tab_corr = tk.Frame(nb, bg=BG)
+        nb.add(tab_corr, text='✏️  Corrections')
+
+        corr_cols    = ('id', 'description', 'gl_code', 'gl_name', 'corrected_at')
+        corr_col_lbl = ('ID', 'Description', 'GL Code', 'GL Name', 'Corrected At')
+        corr_col_w   = (40, 380, 100, 200, 150)
+
+        corr_frame = tk.Frame(tab_corr, bg=BG)
+        corr_frame.pack(fill='both', expand=True, padx=10, pady=10)
+
+        corr_vsb = ttk.Scrollbar(corr_frame, orient='vertical')
+        corr_hsb = ttk.Scrollbar(corr_frame, orient='horizontal')
+        corr_tree = ttk.Treeview(
+            corr_frame, columns=corr_cols, show='headings',
+            selectmode='browse',
+            yscrollcommand=corr_vsb.set, xscrollcommand=corr_hsb.set
+        )
+        corr_vsb.config(command=corr_tree.yview)
+        corr_hsb.config(command=corr_tree.xview)
+
+        for col, lbl, w in zip(corr_cols, corr_col_lbl, corr_col_w):
+            corr_tree.heading(col, text=lbl)
+            corr_tree.column(col, width=w, minwidth=40, anchor='w')
+
+        corr_tree.tag_configure('odd',  background='#252d3d', foreground='white')
+        corr_tree.tag_configure('even', background='#1e2433', foreground='white')
+        corr_vsb.pack(side='right',  fill='y')
+        corr_hsb.pack(side='bottom', fill='x')
+        corr_tree.pack(fill='both', expand=True)
+
+        _corr_count_lbl = tk.Label(tab_corr, text="", bg=BG, fg='#8892a4',
+                                   font=('Segoe UI', 9))
+        _corr_count_lbl.pack(anchor='w', padx=12, pady=(2, 0))
+
+        def _refresh_corr():
+            try:
+                conn = sqlite3.connect(DB_FILE)
+                c    = conn.cursor()
+                c.execute("SELECT id, description, gl_code, gl_name, corrected_at "
+                          "FROM corrections ORDER BY corrected_at DESC")
+                rows = c.fetchall()
+                conn.close()
+            except Exception as e:
+                messagebox.showerror("DB Error", str(e), parent=win)
+                return
+            corr_tree.delete(*corr_tree.get_children())
+            for i, row in enumerate(rows):
+                tag = 'odd' if i % 2 else 'even'
+                corr_tree.insert('', 'end', iid=str(row[0]),
+                                 values=row, tags=(tag,))
+            _corr_count_lbl.config(text=f"{len(rows):,} corrections saved")
+
+        def _delete_corr_row():
+            sel = corr_tree.selection()
+            if not sel:
+                return
+            row_id = int(sel[0])
+            if not messagebox.askyesno("Confirm Delete",
+                                       f"Delete correction ID {row_id}?",
+                                       parent=win):
+                return
+            try:
+                conn = sqlite3.connect(DB_FILE)
+                conn.execute("DELETE FROM corrections WHERE id=?", (row_id,))
+                conn.commit()
+                conn.close()
+                _refresh_corr()
+            except Exception as e:
+                messagebox.showerror("DB Error", str(e), parent=win)
+
+        def _export_corr():
+            rows = corr_tree.get_children()
+            if not rows:
+                messagebox.showwarning("No Data", "No corrections to export.",
+                                       parent=win)
+                return
+            fp = filedialog.asksaveasfilename(
+                parent=win, title="Export Corrections",
+                defaultextension=".xlsx",
+                filetypes=[("Excel files", "*.xlsx")],
+                initialfile=f"DB_Corrections_{datetime.now().strftime('%Y%m%d')}.xlsx"
+            )
+            if not fp:
+                return
+            data = [corr_tree.item(r)['values'] for r in rows]
+            df   = pd.DataFrame(data, columns=corr_col_lbl)
+            try:
+                df.to_excel(fp, index=False)
+                messagebox.showinfo("Export Complete",
+                                    f"✅ Exported {len(data):,} corrections to:\n{fp}",
+                                    parent=win)
+            except Exception as e:
+                messagebox.showerror("Export Error", str(e), parent=win)
+
+        corr_btn = tk.Frame(tab_corr, bg=BG)
+        corr_btn.pack(fill='x', padx=10, pady=(0, 8))
+
+        tk.Button(corr_btn, text="🔄  Refresh",
+                  bg='#3b82f6', fg='white',
+                  font=('Segoe UI', 9, 'bold'), padx=12, pady=4,
+                  command=_refresh_corr
+                  ).pack(side='left', padx=(0, 6))
+        tk.Button(corr_btn, text="📤  Export to Excel",
+                  bg='#00d084', fg='white',
+                  font=('Segoe UI', 9, 'bold'), padx=12, pady=4,
+                  command=_export_corr
+                  ).pack(side='left', padx=(0, 6))
+        tk.Button(corr_btn, text="🗑️  Delete Selected",
+                  bg='#e74c3c', fg='white',
+                  font=('Segoe UI', 9, 'bold'), padx=12, pady=4,
+                  command=_delete_corr_row
+                  ).pack(side='left', padx=(0, 6))
+
+        _refresh_corr()
+
+    # ── helper ────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _excel_date(serial):
+        try:
+            dt = pd.Timestamp('1899-12-30') + pd.Timedelta(days=int(serial))
+            return dt.strftime('%m/%d/%Y')
+        except Exception:
+            return str(serial)
+
+    # ── table ─────────────────────────────────────────────────────────────────
+
+    def _populate_table(self, show_mapping=False):
+        self.tree.delete(*self.tree.get_children())
+        for i, txn in enumerate(self.transactions):
+            date_str = self._excel_date(txn['date'])
+            amt_str  = f"{txn['amount']:,.2f}"
+            if show_mapping:
+                gl     = txn.get('mapped_gl',   '')
+                name   = txn.get('mapped_name', '')
+                score  = txn.get('score',       '')
+                conf   = txn.get('confidence',  '')
+                status = txn.get('status',      '')
+            else:
+                gl = name = score = conf = status = ''
+            conf_disp = {
+                'HIGH':   '✅ HIGH',
+                'MEDIUM': '⚠️  MEDIUM',
+                'LOW':    '❌ LOW',
+            }.get(conf, conf)
+            tag = conf if conf in ('HIGH', 'MEDIUM', 'LOW') else 'MANUAL'
+            if status == 'EXISTING':
+                tag = 'EXISTING'
+            self.tree.insert(
+                '', 'end', iid=str(i),
+                values=(
+                    txn.get('sheet', ''), date_str, amt_str,
+                    txn.get('combined_desc', ''),
+                    gl, name, conf_disp,
+                    f"{score}%" if score != '' else '',
+                    status,
+                ),
+                tags=(tag,)
+            )
+
+    # ── correction dialog ─────────────────────────────────────────────────────
+
+    def _on_double_click(self, _event):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        idx = int(sel[0])
+        self._open_correction_dialog(idx, self.transactions[idx])
+
+    def _open_correction_dialog(self, idx, txn):
+        BG   = '#1e2433'
+        CARD = '#252d3d'
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Correct GL Mapping")
+        dlg.geometry("540x480")
+        dlg.configure(bg=BG)
+        dlg.grab_set()
+
+        tk.Label(dlg, text="✏️  Correct GL Mapping",
+                 bg=BG, fg='white',
+                 font=('Segoe UI', 13, 'bold')).pack(pady=(15, 5))
+        tk.Label(dlg,
+                 text=f"Description:  {txn.get('combined_desc', '')}",
+                 bg=BG, fg='#8892a4',
+                 font=('Segoe UI', 9), wraplength=490, justify='left'
+                 ).pack(padx=20, anchor='w')
+        tk.Label(dlg,
+                 text=(f"Current GL:   "
+                       f"{txn.get('mapped_gl', 'None')}  –  "
+                       f"{txn.get('mapped_name', 'Not mapped')}"),
+                 bg=BG, fg='#f39c12',
+                 font=('Segoe UI', 9)
+                 ).pack(padx=20, anchor='w', pady=(0, 12))
+
+        # ── Load COA from cashbook ────────────────────────────────────────
+        coa_map = {}   # {gl_code: gl_name}
+        try:
+            fund_key  = self.current_fund.get()
+            fund_cfg  = FUND_CONFIGS.get(fund_key, {})
+            cb_path   = self.current_file or fund_cfg.get('cashbook', '')
+            if cb_path and os.path.exists(cb_path):
+                df_coa = pd.read_excel(cb_path, sheet_name='COA',
+                                       dtype=str, usecols=[0, 1])
+                df_coa.columns = ['Account', 'Account Name']
+                df_coa         = df_coa.dropna(subset=['Account'])
+                coa_map        = dict(
+                    zip(df_coa['Account'].str.strip(),
+                        df_coa['Account Name'].str.strip())
+                )
+        except Exception:
+            pass   # COA unavailable — user can still type manually
+
+        # ── GL Code entry with auto-lookup ────────────────────────────────
+        tk.Label(dlg, text="New GL Code:", bg=BG, fg='white',
+                 font=('Segoe UI', 10)).pack(padx=20, anchor='w')
+
+        gl_var   = tk.StringVar(value=txn.get('mapped_gl', ''))
+        name_var = tk.StringVar(value=txn.get('mapped_name', ''))
+
+        gl_entry = tk.Entry(dlg, textvariable=gl_var,
+                            font=('Segoe UI', 11),
+                            bg=CARD, fg='white',
+                            insertbackground='white',
+                            width=30)
+        gl_entry.pack(padx=20, pady=4, anchor='w')
+
+        # Status label — shows match feedback
+        match_lbl = tk.Label(dlg, text="", bg=BG,
+                             font=('Segoe UI', 9))
+        match_lbl.pack(padx=20, anchor='w', pady=(0, 4))
+
+        tk.Label(dlg, text="GL Name:", bg=BG, fg='white',
+                 font=('Segoe UI', 10)).pack(padx=20, anchor='w')
+
+        name_entry = tk.Entry(dlg, textvariable=name_var,
+                              font=('Segoe UI', 11),
+                              bg=CARD, fg='white',
+                              insertbackground='white',
+                              width=40)
+        name_entry.pack(padx=20, pady=4, anchor='w')
+
+        # ── Auto-lookup on GL code change ─────────────────────────────────
+        def _on_gl_change(*_):
+            code = gl_var.get().strip()
+            if code in coa_map:
+                name_var.set(coa_map[code])
+                match_lbl.config(
+                    text=f"✅  Found: {coa_map[code]}",
+                    fg='#00d084'
+                )
+            elif code:
+                # Partial match — show suggestions
+                suggestions = [k for k in coa_map if k.startswith(code)]
+                if suggestions:
+                    match_lbl.config(
+                        text=f"💡  Suggestions: {', '.join(suggestions[:4])}",
+                        fg='#f39c12'
+                    )
+                else:
+                    match_lbl.config(
+                        text="⚠️  GL code not found in COA",
+                        fg='#e74c3c'
+                    )
+            else:
+                match_lbl.config(text="", fg='white')
+
+        gl_var.trace_add('write', _on_gl_change)
+
+        # Trigger once on open in case there's a pre-filled value
+        _on_gl_change()
+
+        remember_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(
+            dlg, text="Remember this correction for future transactions",
+            variable=remember_var,
+            bg=BG, fg='#8892a4', selectcolor=CARD,
+            font=('Segoe UI', 9)
+        ).pack(padx=20, anchor='w', pady=6)
+
+        btn_row = tk.Frame(dlg, bg=BG)
+        btn_row.pack(pady=14)
+
+        def apply():
+            new_gl   = gl_var.get().strip()
+            new_name = name_var.get().strip()
+            if not new_gl:
+                messagebox.showwarning("Missing GL",
+                                       "Please enter a GL code.", parent=dlg)
+                return
+            if new_gl not in coa_map and coa_map:
+                if not messagebox.askyesno(
+                    "GL Not in COA",
+                    f"⚠️  '{new_gl}' was not found in the Chart of Accounts.\n\n"
+                    f"Are you sure you want to use this GL code?",
+                    parent=dlg
+                ):
+                    return
+            self.transactions[idx]['mapped_gl']   = new_gl
+            self.transactions[idx]['mapped_name'] = new_name
+            self.transactions[idx]['confidence']  = 'HIGH'
+            self.transactions[idx]['score']       = 100
+            self.transactions[idx]['status']      = 'CORRECTED'
+            if remember_var.get():
+                self.mapper.save_correction(
+                    txn.get('combined_desc', ''), new_gl, new_name)
+            self._populate_table(show_mapping=True)
+            dlg.destroy()
+
+        def skip_row():
+            self.transactions[idx]['status'] = 'SKIP'
+            self._populate_table(show_mapping=True)
+            dlg.destroy()
+
+        for txt, bg_col, cmd in [
+            ("✅  Apply",  '#00d084', apply),
+            ("⏭  Skip",   '#95a5a6', skip_row),
+            ("Cancel",     '#e74c3c', dlg.destroy),
+        ]:
+            tk.Button(btn_row, text=txt, bg=bg_col, fg='white',
+                      font=('Segoe UI', 10, 'bold'),
+                      padx=14, pady=6, command=cmd
+                      ).pack(side='left', padx=8)
+
+
+# ============================================================================
+# ENTRY POINT
+# ============================================================================
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app  = BalboaProcessorApp(root)
+    root.mainloop()
